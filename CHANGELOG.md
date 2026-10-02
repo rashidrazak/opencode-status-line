@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-02
+
 ### Fixed
 
 - npm installs failed to load with `Cannot find package 'react'`: OpenCode
@@ -58,6 +60,7 @@ Initial release.
   project's `.opencode-status-line.json` and plugin entry options, validated
   with warnings that never break the line
 
-[Unreleased]: https://github.com/rashidrazak/opencode-status-line/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/rashidrazak/opencode-status-line/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.0.2
 [1.0.1]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.0.0
