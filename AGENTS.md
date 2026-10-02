@@ -220,3 +220,17 @@ CLI-only, so consumers add the package name to `cli.json`, never
 `opencode.json`. README links to files outside the tarball (`MANUAL.md`,
 `CONTRIBUTING.md`, `RELEASING.md`) must be absolute GitHub URLs — npm renders
 the README with none of the repository's files around it.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues in `rashidrazak/opencode-status-line`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` at the repo root and ADRs under `docs/adr/`. See `docs/agents/domain.md`.
