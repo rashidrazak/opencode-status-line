@@ -8,6 +8,7 @@ import {
   display,
   endStep,
   endTurn,
+  failStep,
   formatRate,
   liveRate,
   notePeak,
@@ -290,6 +291,53 @@ describe("decode clock", () => {
   })
 })
 
+describe("delta attribution", () => {
+  test("a delta from another message does not move the open step or the window", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 100, 40, T0 + 100, OPTS, "other")
+    expect(meter.step?.chars).toBe(0)
+    expect(meter.step?.decodeMs).toBeUndefined()
+    expect(meter.step?.tokenAt).toBeUndefined()
+    expect(meter.samples).toEqual([])
+    expect(meter.lastDeltaAt).toBe(0)
+  })
+
+  test("a matching delta is credited to the open step", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 100, 40, T0 + 100, OPTS, "msg")
+    observe(meter, T0 + 200, 40, T0 + 200, OPTS, "msg")
+    expect(meter.step?.chars).toBe(80)
+    expect(meter.step?.decodeMs).toBe(100)
+    expect(meter.step?.tokenAt).toBe(T0 + 100)
+    expect(meter.samples).toHaveLength(2)
+  })
+
+  test("a straggler from a settled step is not credited to the next one", () => {
+    const meter = createMeter()
+    beginStep(meter, "a", T0, T0)
+    stream(meter, T0, 1_000, 400) // step a's output, unattributed
+    endStep(meter, "a", 100, T0 + 1_100, T0 + 1_100)
+    beginStep(meter, "b", T0 + 2_000, T0 + 2_000)
+    // Step a's last delta arrives late, after b opened.
+    observe(meter, T0 + 2_100, 40, T0 + 2_100, OPTS, "a")
+    expect(meter.step?.chars).toBe(0)
+    expect(meter.step?.tokenAt).toBeUndefined()
+    expect(meter.lastDeltaAt).toBe(T0 + 1_000)
+    observe(meter, T0 + 2_200, 40, T0 + 2_200, OPTS, "b")
+    expect(meter.step?.chars).toBe(40)
+    expect(meter.lastDeltaAt).toBe(T0 + 2_200)
+  })
+
+  test("an attributed delta with no step open is ignored", () => {
+    const meter = createMeter()
+    observe(meter, T0, 40, T0, OPTS, "msg")
+    expect(meter.samples).toEqual([])
+    expect(meter.lastDeltaAt).toBe(0)
+  })
+})
+
 describe("step settlement", () => {
   test("yields the exact rate and steers the estimate", () => {
     const meter = createMeter()
@@ -356,6 +404,80 @@ describe("step settlement", () => {
     expect(endStep(meter, "msg", 0, T0 + 2_000, T0 + 2_000)).toBeUndefined() // no exact tokens
     expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
     expect(meter.final).toBeUndefined()
+  })
+})
+
+describe("step failure", () => {
+  test("folds the exact tokens a failure reports, then clears the step", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "msg", T0, T0)
+    stream(meter, T0 + 1_000, 2_000, 200) // 400 chars, first token T0+1100, decode 1.9 s
+    expect(failStep(meter, "msg", 160, T0 + 3_100, T0 + 3_100)).toBeCloseTo(84.2, 1)
+    expect(meter.step).toBeUndefined()
+    expect(meter.turn).toEqual({ tokens: 160, ms: 1_900 })
+    expect(meter.final?.kind).toBe("turn")
+    expect(meter.final?.tokens).toBe(160)
+  })
+
+  test("clears a failed step that reported no tokens", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "msg", T0, T0)
+    stream(meter, T0 + 1_000, 1_000, 400)
+    expect(failStep(meter, "msg", 0, T0 + 2_100, T0 + 2_100)).toBeUndefined()
+    expect(meter.step).toBeUndefined()
+    expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
+    expect(meter.final).toBeUndefined()
+    // Nothing streams any more, so the cumulative reading has no step to show.
+    expect(cumulativeRate(meter, T0 + 2_100)).toBeUndefined()
+  })
+
+  test("a failure for another message leaves the open step alone", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    stream(meter, T0, 1_000, 400)
+    expect(failStep(meter, "other", 100, T0 + 2_000, T0 + 2_000)).toBeUndefined()
+    expect(meter.step?.assistantMessageID).toBe("msg")
+    expect(meter.step?.chars).toBe(400)
+    expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
+  })
+})
+
+describe("step retry", () => {
+  test("a repeated start for the same message resumes the open step", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "msg", T0, T0)
+    const stop = stream(meter, T0 + 1_000, 1_000, 400) // 400 chars, first token T0+1100, decode 900 ms
+    const held = cumulativeRate(meter, stop)!
+    expect(held).toBeCloseTo(111.1, 1)
+    const open = meter.step!
+
+    // The provider retries in place: the same assistant message starts again.
+    beginStep(meter, "msg", stop + 4_000, stop + 4_000)
+    expect(meter.step).toBe(open)
+    expect(meter.step?.chars).toBe(400)
+    expect(meter.step?.decodeMs).toBe(900)
+    expect(meter.step?.tokenAt).toBe(T0 + 1_100)
+    expect(meter.step?.tokenArrivedAt).toBe(T0 + 1_100)
+    expect(meter.step?.fromFirstToken).toBe(true)
+    // The measurement so far is untouched...
+    expect(cumulativeRate(meter, stop + 4_000)).toBe(held)
+    // ...and the retry's output continues it; the backoff is not charged
+    // beyond the gap ceiling.
+    observe(meter, stop + 4_100, 40, stop + 4_100, OPTS, "msg")
+    expect(meter.step?.chars).toBe(440)
+    expect(meter.step?.decodeMs).toBe(3_900)
+  })
+
+  test("a start for a different message begins fresh", () => {
+    const meter = createMeter()
+    beginStep(meter, "a", T0, T0)
+    stream(meter, T0, 1_000, 400)
+    beginStep(meter, "b", T0 + 2_000, T0 + 2_000)
+    expect(meter.step).toEqual({ assistantMessageID: "b", chars: 0, at: T0 + 2_000, arrivedAt: T0 + 2_000 })
+    expect(cumulativeRate(meter, T0 + 2_000)).toBeUndefined()
   })
 })
 

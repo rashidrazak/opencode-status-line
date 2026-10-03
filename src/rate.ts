@@ -193,15 +193,24 @@ export function createMeter(opts: RateOptions = DEFAULT_RATE): Meter {
   }
 }
 
-/** Records `chars` of streamed output arriving at `now` (event clock optional). */
+/**
+ * Records `chars` of streamed output arriving at `now` (event clock optional).
+ *
+ * `assistantMessageID` names the step the delta came from. When the events
+ * carry one it must match the open step: output from a step that already
+ * settled — a straggler — is ignored rather than credited to the step now
+ * streaming. An unattributed delta is counted as before.
+ */
 export function observe(
   meter: Meter,
   now: number,
   chars: number,
   eventNow?: number,
   opts: RateOptions = DEFAULT_RATE,
+  assistantMessageID?: string,
 ): void {
   if (chars <= 0) return
+  if (assistantMessageID !== undefined && meter.step?.assistantMessageID !== assistantMessageID) return
   const at = Math.floor(now / opts.bucketMs) * opts.bucketMs
   const last = meter.samples[meter.samples.length - 1]
   if (last && last.at === at) last.chars += chars
@@ -309,8 +318,16 @@ export function cumulativeRate(meter: Meter, now: number, opts: RateOptions = DE
   return tps >= opts.minTps ? tps : undefined
 }
 
-/** A step began streaming; remember its start so its end can be exact. */
+/**
+ * A step began streaming; remember its start so its end can be exact.
+ *
+ * The host reports the same assistant message again when a step retries in
+ * place: that is not a new step, so the open one resumes — characters, decode
+ * time and first-token stamps stay — rather than restarting the measurement.
+ * A start naming a different message replaces the open step as before.
+ */
 export function beginStep(meter: Meter, assistantMessageID: string, at: number, arrivedAt: number): void {
+  if (meter.step?.assistantMessageID === assistantMessageID) return
   // The previous figure deliberately stays on screen while this step finds its
   // feet (TTFT, tools): continuity beats a blank line, and the live estimates
   // replace it the moment this step streams.
@@ -405,6 +422,33 @@ export function endStep(
     }
   }
   return tps
+}
+
+/**
+ * A step failed. Closes the matching open step on the spot — folding whatever
+ * exact tokens the failure reported, when it reported any — so a failed step
+ * neither lingers decaying until the turn ends nor is silently dropped. The
+ * span is chosen exactly as a clean settlement's (see `stepSpan`), and a
+ * failure that names another message, or arrives with no step open, is
+ * ignored: it must not close the step that is actually streaming.
+ */
+export function failStep(
+  meter: Meter,
+  assistantMessageID: string,
+  tokens: number,
+  endedAt: number,
+  now: number,
+  opts: RateOptions = DEFAULT_RATE,
+): number | undefined {
+  const step = meter.step
+  if (!step || step.assistantMessageID !== assistantMessageID) return undefined
+  if (tokens <= 0) {
+    // The failure reported nothing exact: there is nothing to fold, so the
+    // step simply clears rather than being kept alive to decay.
+    meter.step = undefined
+    return undefined
+  }
+  return endStep(meter, assistantMessageID, tokens, endedAt, now, opts)
 }
 
 /** A turn began: start a fresh fold. The previous figure stays for continuity. */

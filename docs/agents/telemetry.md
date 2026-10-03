@@ -28,7 +28,8 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   `tokens` (`windowInfo` in `src/tui.tsx`), or every prompt ever sent is counted.
   Until one lands, both segments draw zero figures rather than vanishing
   (`contextRuns`/`cacheRuns` in `src/render.ts`).
-- Exact token counts arrive only at `session.step.ended`; live figures are
+- Exact token counts arrive when a step settles — `session.step.ended`, or
+  `session.step.failed` when the failure carried them; live figures are
   estimates from stream deltas, calibrated at that point. The settled span
   prefers the observed decode clock, then the host's `session.step.streamed`
   boundary (`streamedAt` on the open step, published before tool settlement),
@@ -37,6 +38,14 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   always fold when positive, even when no span is usable. Tool-argument deltas
   (`session.tool.input.delta`) count as output, and the decode span starts at
   the first token, so TTFT is not charged.
+- A failed step settles on `session.step.failed`: the exact tokens the event
+  reports fold in when it carries any, and the matching open step clears either
+  way (`failStep` in `src/rate.ts`), so a failure neither lingers until turn
+  end nor closes a step that is actually streaming. A repeated
+  `session.step.started` for the message already open resumes that step rather
+  than resetting it, and deltas are attributed by assistant message ID, so a
+  straggler from a finished step is ignored. The pause between attempts is
+  excluded by the same gap ceiling as any other pause.
 
 ## Host registries and the turn lifecycle
 

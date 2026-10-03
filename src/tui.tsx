@@ -7,10 +7,10 @@
  * placement through `usage.surfaces`).
  *
  * The speed segment carries two live readings. OpenCode only learns exact token
- * counts when a step finishes, so the live figures are estimated from streamed
- * output (`session.text.delta`, `session.reasoning.delta`,
- * `session.tool.input.delta`) and calibrated against the exact counts on
- * `session.step.ended`:
+ * counts when a step settles — ends or fails — so the live figures are
+ * estimated from streamed output (`session.text.delta`,
+ * `session.reasoning.delta`, `session.tool.input.delta`) and calibrated
+ * against the exact counts on `session.step.ended` and `session.step.failed`:
  *
  *   sliding     ↯  what the last few seconds look like, right now
  *   cumulative  μ  the average since the turn began (exact tokens from every
@@ -51,6 +51,7 @@ import {
   display,
   endStep,
   endTurn,
+  failStep,
   firstTokenAt,
   formatRate,
   notePeak,
@@ -260,8 +261,10 @@ export default Plugin.define({
       const { delta } = data
       if (typeof delta !== "string" || delta.length === 0) return
       // The event's own clock marks the first token, so the exact figure's span
-      // starts when the model actually began emitting.
-      observe(meter(data.sessionID), Date.now(), delta.length, event.created, opts)
+      // starts when the model actually began emitting. The message ID
+      // attributes the delta: a straggler from an earlier step must not be
+      // charged to the step now streaming.
+      observe(meter(data.sessionID), Date.now(), delta.length, event.created, opts, data.assistantMessageID)
       tick()
     }
 
@@ -333,6 +336,22 @@ export default Plugin.define({
           const output = (tokens.output ?? 0) + (tokens.reasoning ?? 0)
           const endedAt = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
           endStep(meter(data.sessionID), data.assistantMessageID, output, endedAt, Date.now(), opts)
+          bump()
+        }),
+      ),
+      context.data.on(
+        "session.step.failed",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string" || typeof data?.assistantMessageID !== "string") return
+          // A failure settles the matching step on the spot: the exact tokens
+          // the event reports fold in, and a failure without them simply
+          // clears, so the step does not linger decaying until turn end. The
+          // same clock domain as the started and ended stamps.
+          const tokens = data.tokens
+          const output = (tokens?.output ?? 0) + (tokens?.reasoning ?? 0)
+          const endedAt = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
+          failStep(meter(data.sessionID), data.assistantMessageID, output, endedAt, Date.now(), opts)
           bump()
         }),
       ),

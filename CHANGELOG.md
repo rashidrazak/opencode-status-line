@@ -63,6 +63,14 @@ and this project adheres to
   deliberately stays an unweighted per-turn distribution — each finished turn
   counts once whatever its size — and the dialog labels it
   `(unweighted per turn)`, with the manual explaining the difference.
+- **A failed or retried step no longer leaves the speed meter guessing.** When a
+  step fails, the meter closes it the moment the failure is reported and folds
+  whatever exact tokens the event carried, so an interrupted step neither keeps
+  decaying until the turn ends nor disappears uncounted. When the host retries
+  the same assistant message in place, the open step resumes — the characters
+  and decode time already measured are kept — and streamed output is matched to
+  the step that produced it, so a straggler arriving after a retry cannot be
+  credited to the next step.
 
 ## [1.1.0] - 2026-10-03
 

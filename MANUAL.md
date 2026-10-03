@@ -291,9 +291,10 @@ the rest keep the defaults above.
 
 ## 5. Understand and tune the speed meter
 
-OpenCode only reports exact token counts when a step finishes. While the model
-is streaming, the plugin **estimates** speed from the characters it sees, then
-corrects the estimate against the exact counts as they arrive.
+OpenCode only reports exact token counts when a step settles — it finishes or
+fails. While the model is streaming, the plugin **estimates** speed from the
+characters it sees, then corrects the estimate against the exact counts as they
+arrive.
 
 ### The three figures
 
@@ -356,6 +357,17 @@ the plugin met the step mid-stream; only without either does it fall back to
 the step's own end and arrival times. A shell command or any tool the step
 called therefore does not depress the settled figure, and a step with no usable
 span still folds its exact tokens rather than being dropped.
+
+Failed and retried steps settle cleanly too. A step that fails closes as soon
+as the failure is reported, folding any exact tokens the failure carried, so an
+interrupted step neither keeps decaying until the turn ends nor vanishes
+uncounted; a failure without token counts simply closes the step. If the host
+retries the same assistant message in place, the open step resumes — the
+characters and decode time already measured are kept — and streamed output is
+attributed to the step that produced it, so a late delta from a finished step
+is ignored instead of being charged to the next one. The pause between a failed
+attempt and its retry counts no more than `window.maxGapMs`, like any other
+pause.
 
 ### The gauge
 
