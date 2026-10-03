@@ -14,10 +14,12 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   must not fold as a turn; one `message.sync` per session forces the full fetch.
   It sets `final` plus a resting zero `sliding` (empty gauge, `↯ 0.0`) — never
   `turn`, which a later step would absorb — and the rebuilt figure is close to,
-  not bit-identical with, the live one: accept the ~1% tolerance rather than
-  chase it with tool-time heuristics. `time.streamed` is a stream-finalisation
-  stamp, not a first token (see `firstTokenAt`). Window samples and the
-  statistics are memory-only.
+  not bit-identical with, the live one: each step ends at the record's stream
+  boundary (`time.streamed`), the same basis the live settlement prefers,
+  falling back to completion time, so tool time is not charged either way; only
+  the live span's observed decode clock keeps the two from matching exactly.
+  `time.streamed` is never a first token (see `firstTokenAt`). Window samples
+  and the statistics are memory-only.
 - The session record (`data.session.get`) holds token totals cumulative across
   all turns. Context and cache must read the newest assistant message's own
   `tokens` (`windowInfo` in `src/tui.tsx`), or every prompt ever sent is counted.

@@ -571,8 +571,10 @@ palette) to see the numbers behind the meter:
 
 The stats are per process. Restarting OpenCode clears them, because the plugin
 does not store them on disk. A resumed session rebuilds its last settled figure
-from the stored messages, so the meter segment is not blank after a restart —
-the live `↯` figure returns with the next stream.
+from the stored messages — ending each step's span at the same stream boundary
+the live figure prefers, so a tool-heavy turn does not read lower after a
+restart. The meter segment is not blank after the restart; the live `↯` figure
+returns with the next stream.
 
 ---
 

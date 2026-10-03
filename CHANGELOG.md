@@ -49,6 +49,14 @@ and this project adheres to
   times. A shell command or any tool that ran after the response ended no
   longer depresses the final figure, and a step whose span is unusable still
   folds its exact tokens rather than being dropped.
+- **A resumed session's rebuilt speed figure now uses the same decode basis as
+  the live one.** After a restart the plugin rebuilds the last settled figure
+  from the stored messages, but it ended each step's span at the message's
+  completion time, which included any tool the step ran, so a tool-heavy turn
+  read lower than the live figure it replaced. The rebuild now ends the span at
+  the stored stream boundary — the same moment the live settlement prefers —
+  falling back to completion time only when the record keeps no boundary, so
+  the figure you come back to is not dragged down by tool time.
 
 ## [1.1.0] - 2026-10-03
 

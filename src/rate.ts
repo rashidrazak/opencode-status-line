@@ -422,8 +422,8 @@ export function endTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT_R
 /**
  * A completed step as the session record kept it: exact output tokens over a
  * server-clock decode span. `at` is the first token where the record knows it,
- * `endedAt` the step's completion — the closest the record comes to the span
- * `endStep` settles from.
+ * `endedAt` the record's stream boundary when it keeps one — the response body
+ * ending, before any tool settled — and the step's completion otherwise.
  */
 export interface RecordedStep {
   tokens: number
@@ -445,8 +445,8 @@ export interface RecordedMessage {
 
 /**
  * The earliest point the record can place the step's first token: the first
- * timestamp among its reasoning parts. `time.streamed` is a stream
- * finalisation stamp (milliseconds before `completed`), not a start; text parts
+ * timestamp among its reasoning parts. `time.streamed` is the stream boundary
+ * — the response body ending, an end stamp, not a start; text parts
  * carry no timing at all, and a tool part is stamped when its call is
  * registered, after its arguments streamed. A message without a timed reasoning
  * part has no first token in the record, and callers fall back to its start.
@@ -467,7 +467,11 @@ export function firstTokenAt(message: RecordedMessage): number | undefined {
  * output counts, and one without a recorded end or without output is not a
  * measurement. The span starts at the first reasoning timestamp where the
  * record keeps one — the first token — and at the message's own start
- * otherwise, which charges TTFT but cannot invent a timeline.
+ * otherwise, which charges TTFT but cannot invent a timeline. It ends at the
+ * message's stream boundary when the record keeps one — the provider response
+ * body ending, before any tool settled, the same end the live settlement
+ * prefers — and at its completion otherwise, which charges tool time but
+ * cannot invent a boundary.
  *
  * Returns undefined when the messages hold no user message at all: the TUI
  * cache can carry only the newest page of a long session, and folding its tail
@@ -486,7 +490,7 @@ export function recordedSteps(messages: readonly RecordedMessage[]): RecordedSte
     }
     if (message?.type !== "assistant") continue
     const started = firstTokenAt(message) ?? message.time?.created
-    const ended = message.time?.completed
+    const ended = message.time?.streamed ?? message.time?.completed
     const tokens = (message.tokens?.output ?? 0) + (message.tokens?.reasoning ?? 0)
     if (typeof started !== "number" || typeof ended !== "number" || tokens <= 0) continue
     steps.push({ tokens, at: started, endedAt: ended })
@@ -505,12 +509,12 @@ function measurable(step: RecordedStep): boolean {
 /**
  * Rebuild the settled state a finished turn left on the line, from its
  * recorded steps — the resume counterpart of the live `endStep`/`endTurn`
- * pair, for a process that never saw the events. The figure is close to the
- * live one, not bit-identical: the live span ran between event timestamps the
- * record does not keep, and the record's own end carries the finalisation
- * tail, so around a percent of difference is expected and accepted — tool-time
- * heuristics do not narrow it (starting at the last tool's creation, or
- * subtracting tool runs, both overshoot). `final` takes the folded
+ * pair, for a process that never saw the events. Each step's span ends where
+ * the record's stream boundary says the response body ended — the same basis
+ * the live settlement prefers — so tools a step called no longer depress the
+ * figure after a restart. The rebuilt figure is close to, not bit-identical
+ * with, the live one, because the live span may have run on the observed
+ * decode clock instead. `final` takes the folded
  * figure and the sliding reading rests at zero, so the segment keeps its shape
  * — an empty gauge and a resting `↯` — without pretending a window the samples
  * could not support. The turn fold is left empty: a step beginning later must

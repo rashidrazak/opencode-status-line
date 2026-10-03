@@ -533,7 +533,8 @@ describe("resume seed", () => {
       { type: "user", time: { created: T0 - 100_000 } },
       message({ time: { created: T0 - 99_000, completed: T0 - 90_000 }, tokens: { output: 500 } }),
       { type: "user", time: { created: T0 } },
-      // `streamed` is a finalisation stamp, not the decode start.
+      // The stream boundary ends the span; the completion tail after it is
+      // not decode time.
       message({ time: { created: T0 + 100, streamed: T0 + 2_950, completed: T0 + 3_000 } }),
       { type: "shell", time: { created: T0 + 3_050 } },
       message({
@@ -543,22 +544,24 @@ describe("resume seed", () => {
       }),
     ]
     expect(recordedSteps(messages)).toEqual([
-      { tokens: 100, at: T0 + 1_000, endedAt: T0 + 3_000 },
+      { tokens: 100, at: T0 + 1_000, endedAt: T0 + 2_950 },
       { tokens: 100, at: T0 + 3_200, endedAt: T0 + 4_100 },
     ])
   })
 
-  test("skips messages without a completion, a decode start or output", () => {
+  test("skips messages without either end stamp, a decode start or output", () => {
     const messages: RecordedMessage[] = [
       { type: "user", time: { created: T0 } },
       message(),
       message({ tokens: { output: 0, reasoning: 0 } }),
-      message({ time: { created: T0 } }), // still streaming
+      message({ time: { created: T0 } }), // still streaming: neither stamp
+      message({ time: { created: T0, streamed: T0 + 2_000 } }), // stream ended before completion was recorded
       { type: "assistant", tokens: { output: 40 } }, // no times at all
       { type: "assistant", time: { created: T0, completed: T0 + 1_000 }, tokens: { output: 100 } }, // no reasoning: falls back to created
     ]
     expect(recordedSteps(messages)).toEqual([
       { tokens: 100, at: T0 + 1_000, endedAt: T0 + 3_000 },
+      { tokens: 100, at: T0 + 1_000, endedAt: T0 + 2_000 },
       { tokens: 100, at: T0, endedAt: T0 + 1_000 },
     ])
   })
@@ -575,7 +578,36 @@ describe("resume seed", () => {
         ],
       }),
     ]
-    expect(recordedSteps(messages)).toEqual([{ tokens: 100, at: T0 + 1_200, endedAt: T0 + 3_000 }])
+    expect(recordedSteps(messages)).toEqual([{ tokens: 100, at: T0 + 1_200, endedAt: T0 + 2_950 }])
+  })
+
+  test("ends the span at the stream boundary, before a tool's runtime", () => {
+    const messages = [
+      { type: "user", time: { created: T0 - 1 } },
+      message({
+        time: { created: T0, streamed: T0 + 2_000, completed: T0 + 30_000 },
+        content: [
+          { type: "reasoning", time: { created: T0 + 1_000 } },
+          { type: "tool", time: { created: T0 + 2_100, completed: T0 + 29_000 } },
+        ],
+      }),
+    ]
+    expect(recordedSteps(messages)).toEqual([{ tokens: 100, at: T0 + 1_000, endedAt: T0 + 2_000 }])
+    // The seeded figure divides by decode time, not the tool's 29 s: higher
+    // than the old completion-based seed, and the same basis as the live one.
+    const meter = createMeter()
+    expect(restoreFinal(meter, recordedSteps(messages)!, T0 + 30_000)).toBeCloseTo(100, 5)
+  })
+
+  test("falls back to the completion time without a stream boundary", () => {
+    const messages = [
+      { type: "user", time: { created: T0 - 1 } },
+      message({
+        time: { created: T0, completed: T0 + 2_000 },
+        content: [{ type: "reasoning", time: { created: T0 + 1_000, completed: T0 + 1_900 } }],
+      }),
+    ]
+    expect(recordedSteps(messages)).toEqual([{ tokens: 100, at: T0 + 1_000, endedAt: T0 + 2_000 }])
   })
 
   test("falls back to the message start without a timed reasoning part", () => {

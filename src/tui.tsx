@@ -229,8 +229,8 @@ export default Plugin.define({
             if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") chars += part.text.length
           }
           // The first reasoning timestamp is the closest thing to the first
-          // token the record keeps; `time.streamed` is a finalisation stamp,
-          // not a start.
+          // token the record keeps; `time.streamed` is the stream boundary,
+          // an end stamp, not a start.
           const at = firstTokenAt(streaming) ?? streaming.time?.created ?? Date.now()
           const each = meter(sessionID)
           each.step = { assistantMessageID: streaming.id, chars, at, arrivedAt: Date.now(), tokenAt: at, tokenArrivedAt: Date.now() }
