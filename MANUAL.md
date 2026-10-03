@@ -564,9 +564,13 @@ Run `/opencode-status-line` (alias `/tps`, also available in the command
 palette) to see the numbers behind the meter:
 
 - the current readings, in the same shape as the line
-- `avg` — the average over the last `stats.windowMs` of finished turns
-- `mean` — the average of every kept figure
-- `p95` — the 95th percentile, a typical high figure
+- `avg` — the speed of the turns finished in the last `stats.windowMs`: every
+  token they produced over every millisecond they spent decoding, so a long
+  turn counts for more than a short one
+- `mean` — the same token-weighted figure across every kept turn
+- `p95` — the 95th percentile of the finished turns themselves, each counting
+  once whatever its size; an unweighted per-turn distribution, so it reads as a
+  typical high figure rather than an overall speed
 - how many figures are behind the statistics
 
 The stats are per process. Restarting OpenCode clears them, because the plugin

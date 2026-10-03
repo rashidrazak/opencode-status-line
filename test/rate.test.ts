@@ -24,6 +24,7 @@ import {
   type RateOptions,
   type RecordedMessage,
   type RecordedStep,
+  type TurnSample,
 } from "../src/rate.ts"
 
 const T0 = 1_000_000
@@ -464,6 +465,9 @@ describe("turn fold", () => {
     endTurn(meter, T0 + 3_500)
     expect(meter.history).toHaveLength(1)
     expect(meter.history[0]!.tps).toBeCloseTo(166.7, 1)
+    // The exact totals ride along, for the token-weighted statistics.
+    expect(meter.history[0]!.tokens).toBe(300)
+    expect(meter.history[0]!.ms).toBeCloseTo(1_800, 5)
   })
 
   test("folding off keeps each step's own figure", () => {
@@ -476,6 +480,8 @@ describe("turn fold", () => {
     expect(meter.final?.kind).toBe("step")
     endTurn(meter, T0 + 2_200, opts)
     expect(meter.history[0]!.tps).toBeCloseTo(111.1, 1)
+    expect(meter.history[0]!.tokens).toBe(100)
+    expect(meter.history[0]!.ms).toBeCloseTo(900, 5)
   })
 
   test("closing a turn twice does not double-count it", () => {
@@ -634,7 +640,8 @@ describe("resume seed", () => {
     const steps = [step(100, T0, T0 + 1_000), step(200, T0 + 1_100, T0 + 2_600)]
     // 300 tokens over 2.5 s, not the newest step's 133.
     expect(restoreFinal(meter, steps, T0 + 3_000)).toBeCloseTo(120, 5)
-    expect(meter.final).toEqual({ tps: 120, at: T0 + 3_000, kind: "turn" })
+    // The rebuilt totals ride along with the figure.
+    expect(meter.final).toEqual({ tps: 120, at: T0 + 3_000, kind: "turn", tokens: 300, ms: 2_500 })
     // The fold stays empty so a step starting later cannot absorb a stale turn.
     expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
     // A resting window reading keeps the segment's shape without inventing a figure.
@@ -647,7 +654,7 @@ describe("resume seed", () => {
     const meter = createMeter(opts)
     const steps = [step(100, T0, T0 + 1_000), step(100, T0 + 2_000, T0 + 4_000)]
     expect(restoreFinal(meter, steps, T0 + 5_000, opts)).toBeCloseTo(50, 5)
-    expect(meter.final?.kind).toBe("step")
+    expect(meter.final).toEqual({ tps: 50, at: T0 + 5_000, kind: "step", tokens: 100, ms: 2_000 })
     const view = display(meter, T0 + 6_000, ["sliding", "cumulative"], opts)
     expect(view?.readings.map((reading) => reading.label)).toEqual(["↯", "✓"])
   })
@@ -817,7 +824,11 @@ describe("display", () => {
 describe("statistics", () => {
   test("peaks over completed turns", () => {
     const meter = createMeter()
-    meter.history.push({ tps: 10, at: T0 }, { tps: 60, at: T0 + 1 }, { tps: 30, at: T0 + 2 })
+    meter.history.push(
+      { tps: 10, at: T0, tokens: 1, ms: 100 },
+      { tps: 60, at: T0 + 1, tokens: 6, ms: 100 },
+      { tps: 30, at: T0 + 2, tokens: 3, ms: 100 },
+    )
     expect(peakTps(meter)).toBe(60)
   })
 
@@ -840,14 +851,74 @@ describe("statistics", () => {
     expect(meter.peak).toBe(recorded)
   })
 
-  test("averages a rolling window, all-time mean and p95", () => {
+  test("weights the rolling average and the all-time mean by exact tokens", () => {
     const meter = createMeter()
-    meter.history.push({ tps: 10, at: T0 }, { tps: 20, at: T0 + 1_000 }, { tps: 60, at: T0 + 2_000 })
+    // Two tiny fast turns around one large slow one. Counting turns equally
+    // would read them near 30; weighing by tokens follows the slow turn.
+    meter.history.push(
+      { tps: 100, at: T0, tokens: 10, ms: 100 },
+      { tps: 10, at: T0 + 1_000, tokens: 1_000, ms: 100_000 },
+      { tps: 50, at: T0 + 2_000, tokens: 5, ms: 100 },
+    )
     const stats = tpsStats(meter, T0 + 2_000, 1_500)
-    expect(stats.avg).toBeCloseTo(40, 5)
-    expect(stats.mean).toBeCloseTo(30, 5)
-    expect(stats.p95).toBeCloseTo(60, 5)
+    // The window holds the slow turn and the last fast one: 1005 tokens over
+    // 100.1 s of decode time.
+    expect(stats.avg).toBeCloseTo(10.04, 2)
+    // All three turns: 1015 tokens over 100.2 s.
+    expect(stats.mean).toBeCloseTo(10.13, 2)
+    // The percentile stays an unweighted per-turn figure: the tiny fast turn
+    // leads it although its token mass is negligible.
+    expect(stats.p95).toBe(100)
     expect(stats.count).toBe(3)
+  })
+
+  test("a window with no recent samples reports a zero average", () => {
+    const meter = createMeter()
+    meter.history.push({ tps: 10, at: T0, tokens: 1_000, ms: 100_000 })
+    const stats = tpsStats(meter, T0 + 10_000, 1_500)
+    expect(stats.avg).toBe(0)
+    expect(stats.mean).toBeCloseTo(10, 5)
+    expect(stats.p95).toBeCloseTo(10, 5)
+  })
+
+  test("samples from before the totals existed do not poison the averages", () => {
+    const meter = createMeter()
+    // A history that survived a hot reload from the generation whose samples
+    // carried the figure but no tokens or decode milliseconds.
+    meter.history.push({ tps: 42, at: T0 } as TurnSample)
+    meter.history.push({ tps: 20, at: T0 + 1_000, tokens: 200, ms: 10_000 })
+    const stats = tpsStats(meter, T0 + 1_000, 60_000)
+    expect(stats.avg).toBeCloseTo(20, 5)
+    expect(stats.mean).toBeCloseTo(20, 5)
+    // The per-turn distribution still counts the legacy figure.
+    expect(stats.p95).toBe(42)
+    expect(stats.count).toBe(2)
+  })
+
+  test("a large slow turn outweighs tiny fast ones through settlement", () => {
+    const meter = createMeter()
+    for (let index = 0; index < 3; index++) {
+      const at = T0 + index * 10_000
+      beginTurn(meter, at)
+      beginStep(meter, `tiny${index}`, at, at)
+      stream(meter, at + 100, 200, 400) // two deltas, one 100 ms decode gap
+      endStep(meter, `tiny${index}`, 10, at + 400, at + 400)
+      endTurn(meter, at + 500)
+    }
+    const slowAt = T0 + 40_000
+    beginTurn(meter, slowAt)
+    beginStep(meter, "slow", slowAt, slowAt)
+    stream(meter, slowAt + 100, 9_800, 40) // 97 decode gaps of 100 ms
+    endStep(meter, "slow", 100, slowAt + 10_000, slowAt + 10_000)
+    endTurn(meter, slowAt + 10_300)
+
+    // 130 tokens over 10 s of decode time, not the ~78 the four per-turn
+    // figures average to.
+    const stats = tpsStats(meter, slowAt + 10_300, 60_000)
+    expect(stats.avg).toBeCloseTo(13, 5)
+    expect(stats.mean).toBeCloseTo(13, 5)
+    expect(stats.p95).toBeCloseTo(100, 5)
+    expect(stats.count).toBe(4)
   })
 
   test("an empty meter reports zeros", () => {

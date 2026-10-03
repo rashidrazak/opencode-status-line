@@ -3,8 +3,10 @@
  * cumulative average since the turn began, and the exact figures steps settle
  * with. The turn fold accumulates exact tokens and decode milliseconds across
  * a turn's steps, so a tool-heavy turn reports one weighted number rather than
- * a row of per-step figures. It also rebuilds a finished turn's settled figure
- * from a session's stored messages, for a process that never saw the events.
+ * a row of per-step figures — the same totals the statistics fold for `avg`
+ * and `mean`, while `p95` stays the unweighted per-turn distribution. It also
+ * rebuilds a finished turn's settled figure from a session's stored messages,
+ * for a process that never saw the events.
  *
  * Everything is a pure function of a `Meter` plus options, JSX-free and free
  * of OpenCode imports, so it can be exercised directly:
@@ -137,11 +139,19 @@ export interface Final {
   at: number
   /** "turn" when the figure folds the turn, "step" when it is one step's own. */
   kind: "turn" | "step"
+  /** Exact output tokens the figure divides. */
+  tokens: number
+  /** Decode milliseconds it divides them by. */
+  ms: number
 }
 
 export interface TurnSample {
   tps: number
   at: number
+  /** Exact output tokens this figure was folded from. */
+  tokens: number
+  /** Decode milliseconds those tokens took. */
+  ms: number
 }
 
 export interface Meter {
@@ -380,7 +390,13 @@ export function endStep(
   }
   const folded = opts.turnFold && meter.turn.ms > 0
   const tps = folded ? meter.turn.tokens / (meter.turn.ms / 1000) : stepTps
-  meter.final = { tps, at: now, kind: folded ? "turn" : "step" }
+  meter.final = {
+    tps,
+    at: now,
+    kind: folded ? "turn" : "step",
+    tokens: folded ? meter.turn.tokens : tokens,
+    ms: folded ? meter.turn.ms : ms,
+  }
   notePeak(meter, tps)
   if (opts.calibrate && step.chars >= RATIO_MIN_CHARS) {
     const ratio = step.chars / tokens
@@ -401,14 +417,16 @@ export function beginTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT
   meter.step = undefined
 }
 
-/** A turn ended: keep its figure forever, and remember it for the statistics. */
+/** A turn ended: keep its figure forever, and remember its exact totals for the statistics. */
 export function endTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): void {
   if (opts.turnFold && meter.turn.ms > 0) {
-    const tps = meter.turn.tokens / (meter.turn.ms / 1000)
-    meter.final = { tps, at: now, kind: "turn" }
-    meter.history.push({ tps, at: now })
+    const { tokens, ms } = meter.turn
+    const tps = tokens / (ms / 1000)
+    meter.final = { tps, at: now, kind: "turn", tokens, ms }
+    meter.history.push({ tps, at: now, tokens, ms })
   } else if (!opts.turnFold && meter.final?.kind === "step") {
-    meter.history.push({ tps: meter.final.tps, at: now })
+    const { tokens, ms } = meter.final
+    meter.history.push({ tps: meter.final.tps, at: now, tokens, ms })
   }
   if (meter.history.length > opts.historySamples) {
     meter.history.splice(0, meter.history.length - opts.historySamples)
@@ -528,9 +546,9 @@ export function restoreFinal(
   opts: RateOptions = DEFAULT_RATE,
 ): number | undefined {
   let tps: number | undefined
+  let tokens = 0
+  let ms = 0
   if (opts.turnFold) {
-    let tokens = 0
-    let ms = 0
     for (const step of steps) {
       if (!measurable(step)) continue
       tokens += step.tokens
@@ -541,12 +559,14 @@ export function restoreFinal(
     for (let index = steps.length - 1; index >= 0; index--) {
       const step = steps[index]!
       if (!measurable(step)) continue
-      tps = step.tokens / ((step.endedAt - step.at) / 1000)
+      tokens = step.tokens
+      ms = step.endedAt - step.at
+      tps = tokens / (ms / 1000)
       break
     }
   }
   if (tps === undefined) return undefined
-  meter.final = { tps, at: now, kind: opts.turnFold ? "turn" : "step" }
+  meter.final = { tps, at: now, kind: opts.turnFold ? "turn" : "step", tokens, ms }
   meter.sliding = { tps: 0, at: now }
   notePeak(meter, tps)
   return tps
@@ -674,25 +694,47 @@ export function peakTps(meter: Meter): number {
 }
 
 export interface TpsStats {
-  /** Mean of the samples inside the rolling window. */
+  /** Token-weighted mean of the samples inside the rolling window. */
   avg: number
-  /** Mean of every sample. */
+  /** Token-weighted mean of every sample: all tokens over all decode time. */
   mean: number
-  /** 95th percentile of every sample. */
+  /** Unweighted 95th percentile of every sample's own figure. */
   p95: number
   count: number
 }
 
+/**
+ * The statistics behind the dialog. `avg` and `mean` fold what each finished
+ * turn actually produced — its exact tokens over its decode milliseconds — so
+ * one large slow turn outweighs a handful of tiny fast ones. `p95` deliberately
+ * stays an unweighted per-turn distribution: each finished turn counts once,
+ * whatever its size, so it reads as a typical high figure rather than an
+ * overall speed.
+ */
 export function tpsStats(meter: Meter, now: number, windowMs: number): TpsStats {
   const samples = meter.history
   if (samples.length === 0) return { avg: 0, mean: 0, p95: 0, count: 0 }
   const window = samples.filter((sample) => now - sample.at <= windowMs)
-  const avg =
-    window.length > 0 ? window.reduce((sum, sample) => sum + sample.tps, 0) / window.length : 0
-  const mean = samples.reduce((sum, sample) => sum + sample.tps, 0) / samples.length
   const sorted = samples.map((sample) => sample.tps).sort((a, b) => a - b)
   const p95 = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] ?? 0
-  return { avg, mean, p95, count: samples.length }
+  return { avg: weightedRate(window), mean: weightedRate(samples), p95, count: samples.length }
+}
+
+/** Token totals over decode-time totals — the honest mean of unlike turns. */
+function weightedRate(samples: readonly TurnSample[]): number {
+  let tokens = 0
+  let ms = 0
+  for (const sample of samples) {
+    // The meter map survives a hot reload on `globalThis`, so a history kept
+    // from a generation before the totals existed can hold samples without
+    // them. They are skipped rather than poisoning the sums with `undefined`:
+    // their figures still count in `count` and `p95`, and the weighted figures
+    // catch up as new turns land.
+    if (!Number.isFinite(sample.tokens) || !Number.isFinite(sample.ms)) continue
+    tokens += sample.tokens
+    ms += sample.ms
+  }
+  return ms > 0 ? tokens / (ms / 1000) : 0
 }
 
 /**

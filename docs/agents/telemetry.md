@@ -19,7 +19,10 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   falling back to completion time, so tool time is not charged either way; only
   the live span's observed decode clock keeps the two from matching exactly.
   `time.streamed` is never a first token (see `firstTokenAt`). Window samples
-  and the statistics are memory-only.
+  and the statistics are memory-only. Each history sample carries the turn's
+  exact tokens and decode milliseconds; `avg`/`mean` fold those totals
+  token-weighted, while `p95` stays the unweighted per-turn distribution
+  (`tpsStats` in `src/rate.ts`).
 - The session record (`data.session.get`) holds token totals cumulative across
   all turns. Context and cache must read the newest assistant message's own
   `tokens` (`windowInfo` in `src/tui.tsx`), or every prompt ever sent is counted.

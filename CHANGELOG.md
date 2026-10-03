@@ -57,6 +57,12 @@ and this project adheres to
   the stored stream boundary — the same moment the live settlement prefers —
   falling back to completion time only when the record keeps no boundary, so
   the figure you come back to is not dragged down by tool time.
+- **The stats dialog's `avg` and `mean` are now token-weighted.** Each is the
+  exact tokens the finished turns produced over the decode time those tokens
+  took, so a few tiny fast turns can no longer outvote one large slow one. `p95`
+  deliberately stays an unweighted per-turn distribution — each finished turn
+  counts once whatever its size — and the dialog labels it
+  `(unweighted per turn)`, with the manual explaining the difference.
 
 ## [1.1.0] - 2026-10-03
 

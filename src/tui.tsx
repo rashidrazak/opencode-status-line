@@ -662,7 +662,7 @@ export default Plugin.define({
           </text>
           <text>
             {stats() && stats()!.count > 0
-              ? `avg ${Math.round(config.statsWindowMs / 1000)}s ${formatRate(stats()!.avg)} · mean ${formatRate(stats()!.mean)} · p95 ${formatRate(stats()!.p95)} · ${stats()!.count} turns`
+              ? `avg ${Math.round(config.statsWindowMs / 1000)}s ${formatRate(stats()!.avg)} · mean ${formatRate(stats()!.mean)} · p95 ${formatRate(stats()!.p95)} (unweighted per turn) · ${stats()!.count} turns`
               : "no completed turns yet"}
           </text>
         </box>
