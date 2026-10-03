@@ -159,9 +159,16 @@ describe("validation", () => {
     expect(warnings.some((warning) => warning.includes("cap.mode"))).toBe(true)
   })
 
-  test("window.hold can turn the held reading off", () => {
-    const { config } = read({ [PROJECT]: JSON.stringify({ window: { hold: false } }) })
-    expect(config.holdSliding).toBe(false)
+  test("window.hold takes true, false and \"last\", and rejects anything else", () => {
+    expect(read({}).config.holdSliding).toBe(true)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { hold: true } }) }).config.holdSliding).toBe(true)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { hold: false } }) }).config.holdSliding).toBe(false)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { hold: "last" } }) }).config.holdSliding).toBe("last")
+    for (const bad of ["latest", "true", 1]) {
+      const { config, warnings } = read({ [PROJECT]: JSON.stringify({ window: { hold: bad } }) })
+      expect(config.holdSliding).toBe(DEFAULT_CONFIG.holdSliding)
+      expect(warnings.some((warning) => warning.includes("window.hold"))).toBe(true)
+    }
   })
 
   test("window.maxGapMs bounds the decode clock's gaps", () => {

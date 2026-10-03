@@ -29,10 +29,13 @@ and this project adheres to
 - **The live speed reading (`↯`) now tells the truth on slow and stalled
   streams.** It is estimated over the span the retained stream deltas actually
   cover, so output arriving a second or two apart reads its real pace instead of
-  up to twice as fast, streams slower than the window show no live reading
-  rather than a floor near 1.25 tok/s, and the dimmed figure left behind when
-  output stops keeps the last value the line actually showed instead of jumping
-  back to the burst peak. Fast streams read as before.
+  up to twice as fast, and streams slower than the window show no live reading
+  rather than a floor near 1.25 tok/s. When output stops, the figure no longer
+  freezes at its last value: it rests at `↯ 0.0`, dimmed over an empty gauge —
+  the same shape a resumed session shows — so a shell command, a tool run or a
+  stalled stream reads as genuinely idle. `window.hold: "last"` restores the
+  previous hold-the-last-value behaviour, and `window.hold: false` hides the
+  segment whenever there is no live reading. Fast streams read as before.
 - **The turn average (`μ`) now counts token-producing time only.** Each gap
   between streamed deltas advances its decode clock, and a pause longer than
   `window.maxGapMs` (default `3000` ms; `0` counts pauses in full) counts only

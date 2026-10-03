@@ -299,7 +299,7 @@ corrects the estimate against the exact counts as they arrive.
 
 | Figure | Label | What it means |
 | --- | --- | --- |
-| Sliding | `↯` | Speed over the last few seconds — what is happening right now |
+| Sliding | `↯` | Speed over the last few seconds — what is happening right now; rests at `0.0` when nothing is streaming (see [`window.hold`](#the-speed-window)) |
 | Cumulative | `μ` or `avg` | Average across this turn so far: exact tokens from finished steps plus the step in flight, over the time spent producing tokens |
 | Settled | `μ` / `avg` / `✓` | The final figure from a finished step or turn, kept on screen; measured on decode time, so tool runtime is not charged |
 
@@ -328,13 +328,19 @@ turn average's decode clock (`μ`):
 | `window.minSpanMs` | `800` | 0–600000 | Ignore spans shorter than this, so the first moment of a stream does not swing wildly |
 | `window.minTps` | `0.5` | 0–10000 | Speeds below this count as silence and hide the reading |
 | `window.bucketMs` | `100` | 1–10000 | Group incoming characters into buckets of this size before measuring |
-| `window.hold` | `true` | true/false | Keep the last reading on screen (dimmed) after the stream stops |
+| `window.hold` | `true` | `true` / `false` / `"last"` | What the sliding figure (`↯`) does when no live reading exists: `true` rests it at `0.0` (dimmed, over an empty gauge), `false` hides the segment, `"last"` keeps the last value on screen |
 
 ```json
 {
   "window": { "ms": 5000, "hold": false }
 }
 ```
+
+When output stops, the sliding figure settles at `↯ 0.0` instead of freezing
+at its last value: with the default `window.hold: true` the dimmed figure and
+its empty gauge keep the line's shape — the same shape a resumed session
+already shows. `false` drops the segment whenever there is no live reading,
+and `"last"` keeps the previous behaviour of holding the last value on screen.
 
 The turn average (`μ`) measures token-producing time only: each gap between
 streamed deltas counts when the later delta arrives, and nothing after the
@@ -603,7 +609,7 @@ Every key, its default, and the values it accepts. All keys are optional.
 | `window.minSpanMs` | `800` | number 0–600000 |
 | `window.minTps` | `0.5` | number 0–10000 |
 | `window.bucketMs` | `100` | number 1–10000 |
-| `window.hold` | `true` | `true` / `false` |
+| `window.hold` | `true` | `true` / `false` / `"last"` |
 | `turn.fold` | `true` | `true` / `false` |
 | `calibration.enabled` | `true` | `true` / `false` |
 | `calibration.charsPerToken` | `4` | number 0.5–50 |
@@ -678,7 +684,7 @@ Copy any block into your config file as a starting point.
 }
 ```
 
-**A calmer meter** — longer window, no held reading:
+**A calmer meter** — longer window, no reading when idle:
 
 ```json
 {

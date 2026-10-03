@@ -14,6 +14,13 @@
 
 export type LiveReading = "sliding" | "cumulative"
 
+/**
+ * What the sliding segment does when no live reading exists: `true` (the
+ * default) keeps it visible resting at zero, `false` hides it, and `"last"`
+ * keeps the last live reading on screen.
+ */
+export type HoldMode = boolean | "last"
+
 export interface RateOptions {
   /** How much streamed output the sliding estimate looks back over. */
   windowMs: number
@@ -41,11 +48,11 @@ export interface RateOptions {
   /** Completed figures kept for the statistics. */
   historySamples: number
   /**
-   * Keep the last live sliding reading on screen after the stream stops. The
-   * held value wears the muted shade, so history is visible without pretending
-   * to be live.
+   * What the sliding segment does once no live reading exists. `true` rests it
+   * at zero, dimmed over an empty gauge; `false` hides the segment; `"last"`
+   * keeps the last live reading on screen.
    */
-  holdSliding: boolean
+  holdSliding: HoldMode
 }
 
 export const DEFAULT_RATE: RateOptions = {
@@ -152,8 +159,9 @@ export interface Meter {
   final?: Final
   /**
    * The last live sliding reading, remembered by `liveRate` as it is produced,
-   * so the dimmed figure held after the stream stops is the last one shown —
-   * never a stale snapshot of a burst. A restore without one rests it at zero.
+   * so `window.hold: "last"` can re-show exactly the value the line showed
+   * live — never a stale snapshot of a burst. A restore without one rests it
+   * at zero.
    */
   sliding?: { tps: number; at: number }
   /**
@@ -242,8 +250,8 @@ function prune(meter: Meter, now: number, opts: RateOptions): void {
  *
  * Undefined once the stream has been quiet for a window, or while the figure is
  * below `minTps` (silence, by the knob's own meaning). A figure at or above the
- * floor is remembered on the meter, so the held reading is the last value the
- * line showed live — never a stale delta snapshot.
+ * floor is remembered on the meter, so `window.hold: "last"` re-shows the last
+ * value the line showed live — never a stale delta snapshot.
  */
 export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): number | undefined {
   prune(meter, now, opts)
@@ -592,13 +600,17 @@ export const USAGE_LABELS: Record<LabelStyle, UsageLabels> = {
  * The two families have a life of their own rather than appearing and
  * vanishing with the stream:
  *
- *   sliding     live while the retained deltas give a rate, then the last reading held
+ *   sliding     live while the retained deltas give a rate, then at rest —
+ *               `window.hold` says whether it shows `0.0`, hides, or keeps
+ *               the last reading
  *   cumulative  live while a step is in flight, then the settled turn average
  *
- * A held or settled figure wears `live: false` and is drawn dimmed, so history
- * stays visible without pretending to be current. With holding off the sliding
- * reading disappears as it used to, and with `readings: []` only the settled
- * figure remains.
+ * A resting, held or settled figure wears `live: false` and is drawn dimmed,
+ * so the line keeps its shape without pretending to be current. The sliding
+ * segment rests at zero — the same shape a resumed session shows — unless
+ * `"last"` keeps the previous value or `false` drops the segment; while the
+ * window still holds deltas the live figure shows as before. With
+ * `readings: []` only the settled figure remains.
  *
  * `labels` names the figures (`USAGE_LABELS` holds the icon and word sets);
  * the counts and the geometry never depend on it.
@@ -614,8 +626,14 @@ export function display(
   if (readings.includes("sliding")) {
     const tps = liveRate(meter, now, opts)
     if (tps !== undefined) shown.push({ key: "sliding", label: labels.sliding, tps, live: true })
-    else if (opts.holdSliding && meter.sliding) {
-      shown.push({ key: "sliding", label: labels.sliding, tps: meter.sliding.tps, live: false })
+    else if (opts.holdSliding === "last") {
+      if (meter.sliding) {
+        shown.push({ key: "sliding", label: labels.sliding, tps: meter.sliding.tps, live: false })
+      }
+    } else if (opts.holdSliding === true) {
+      // No live reading: rest the segment at zero so the line keeps its shape
+      // over an empty gauge, rather than re-showing a stale figure.
+      shown.push({ key: "sliding", label: labels.sliding, tps: 0, live: false })
     }
   }
   if (readings.includes("cumulative")) {

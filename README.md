@@ -30,8 +30,10 @@ and elapsed time. Segments with nothing to show are hidden.
 - **Cache** (`⧉`): how much of the model's input came from cache, and the
   cached token count.
 - **Speed**: the current streaming speed (`↯`) and the average for the turn
-  (`μ`). When a stream stops, the last reading stays on screen in a dimmed
-  colour.
+  (`μ`). When a stream stops, the speed segment rests at `↯ 0.0` in a dimmed
+  colour with an empty gauge — the same shape a resumed session shows.
+  `window.hold: "last"` keeps the last reading on screen instead, and `false`
+  hides the segment whenever there is no live reading.
 - **Cost and time**: the session's cost so far and how long it has been
   running.
 - **Uncommitted changes**: added and removed line counts for staged, unstaged

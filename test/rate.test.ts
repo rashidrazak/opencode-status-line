@@ -68,8 +68,8 @@ describe("sliding rate over sparse cadences", () => {
   /**
    * Drive the meter the way the ticker does: one-token deltas arrive on the
    * cadence `nextGap` schedules and the line repaints every 250 ms. Returns
-   * the sliding reading each repaint showed, held figures included, so a test
-   * can compare what the user saw with the truth.
+   * the sliding reading each repaint showed, resting figures included, so a
+   * test can inspect the live cadence and the idle shape.
    */
   function repaint(
     meter: Meter,
@@ -94,6 +94,10 @@ describe("sliding rate over sparse cadences", () => {
   const mean = (readings: { tps: number }[]): number =>
     readings.reduce((sum, reading) => sum + reading.tps, 0) / readings.length
 
+  /** The readings where a live figure was shown; the resting zeros are the idle shape. */
+  const liveOnly = (readings: { tps: number; live: boolean }[]) =>
+    readings.filter((reading) => reading.live)
+
   test("reads slow but regular streams at their true cadence", () => {
     for (const [gap, truth] of [
       [500, 2],
@@ -101,16 +105,19 @@ describe("sliding rate over sparse cadences", () => {
       [1_500, 2 / 3],
       [2_000, 0.5],
     ] as const) {
-      const readings = repaint(createMeter(), T0, 60_000, () => gap)
+      const readings = liveOnly(repaint(createMeter(), T0, 60_000, () => gap))
       expect(readings.length).toBeGreaterThan(0)
       expect(mean(readings)).toBeGreaterThan(truth * 0.9)
       expect(mean(readings)).toBeLessThan(truth * 1.1)
     }
   })
 
-  test("shows nothing when deltas are 2.5 s or more apart", () => {
+  test("never shows a live reading when deltas are 2.5 s or more apart", () => {
     for (const gap of [2_500, 2_900, 3_500, 6_000, 30_000]) {
-      expect(repaint(createMeter(), T0, 60_000, () => gap)).toHaveLength(0)
+      const readings = repaint(createMeter(), T0, 60_000, () => gap)
+      expect(readings.length).toBeGreaterThan(0)
+      // Below minTps there is no live figure; the segment rests at zero.
+      expect(readings.every((reading) => !reading.live && reading.tps === 0)).toBe(true)
     }
   })
 
@@ -119,7 +126,10 @@ describe("sliding rate over sparse cadences", () => {
     observe(meter, T0, 4)
     observe(meter, T0 + WINDOW + 1_000, 4)
     expect(liveRate(meter, T0 + WINDOW + 1_100)).toBeUndefined()
-    expect(display(meter, T0 + WINDOW + 1_100, ["sliding"])).toBeUndefined()
+    // No live reading: the segment rests at zero rather than scoring the delta.
+    const resting = display(meter, T0 + WINDOW + 1_100, ["sliding"])?.readings[0]
+    expect(resting?.tps).toBe(0)
+    expect(resting?.live).toBe(false)
   })
 
   test("keeps fast streams at their pace", () => {
@@ -127,7 +137,7 @@ describe("sliding rate over sparse cadences", () => {
     expect(Math.abs(mean(readings) / 10 - 1)).toBeLessThan(0.03)
   })
 
-  test("a stopped burst decays and never re-inflates the held figure", () => {
+  test("a stopped burst decays live, then the reading rests at zero", () => {
     const meter = createMeter()
     // 20 tokens in one second: nine 8-char deltas, then the tenth at the tick.
     for (let index = 0; index < 9; index++) observe(meter, T0 + 100 + index * 100, 8)
@@ -135,12 +145,14 @@ describe("sliding rate over sparse cadences", () => {
     const live = readings.filter((reading) => reading.live)
     expect(live.length).toBeGreaterThan(1)
     for (let index = 1; index < live.length; index++) {
+      // The density view decays: each live repaint reads at most the last one.
       expect(live[index]!.tps).toBeLessThanOrEqual(live[index - 1]!.tps)
     }
-    const behind = readings.filter((reading) => !reading.live)
-    expect(behind.length).toBeGreaterThan(0)
-    const lastLive = live[live.length - 1]!.tps
-    for (const reading of behind) expect(reading.tps).toBeLessThanOrEqual(lastLive)
+    const resting = readings.filter((reading) => !reading.live)
+    expect(resting.length).toBeGreaterThan(0)
+    // Once no live reading exists, the segment rests at zero — never at the
+    // burst peak it used to hold.
+    for (const reading of resting) expect(reading.tps).toBe(0)
   })
 
   test("tracks jittered delivery instead of piling up the gaps", () => {
@@ -165,7 +177,9 @@ describe("sliding rate over sparse cadences", () => {
         const reading = display(meter, now, ["sliding"])?.readings[0]
         if (reading) readings.push({ tps: reading.tps, live: reading.live })
       }
-      return { truth: tokens / 60, mean: mean(readings) }
+      // The resting zeros between readings are the idle shape; the live
+      // readings are what must track the cadence.
+      return { truth: tokens / 60, mean: mean(liveOnly(readings)) }
     }
     for (const seed of [7, 11]) {
       const fast = jitter(1_000, seed)
@@ -669,17 +683,45 @@ describe("display", () => {
     expect(view?.readings.map((reading) => reading.key)).toEqual(["sliding"])
   })
 
-  test("holds the sliding reading after the stream stops, and settles the average", () => {
+  test("window.hold true rests the sliding reading at zero once the window empties", () => {
     const meter = createMeter()
     beginTurn(meter, T0)
     beginStep(meter, "msg", T0, T0)
     const now = stream(meter, T0, 1_000, 400)
-    const held = liveRate(meter, now)! // the last live sliding figure
-    expect(held).toBeDefined()
+    expect(liveRate(meter, now)).toBeDefined() // a last live figure exists to forget
     endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100) // 100 tokens in 1 s
     const later = T0 + 1_100 + WINDOW + 100
 
     const settled = display(meter, later, ["sliding", "cumulative"])
+    expect(settled?.live).toBe(false)
+    expect(settled?.readings.map((reading) => reading.key)).toEqual(["sliding", "cumulative"])
+    // The dimmed figure rests at 0.0, not at the last live value.
+    expect(settled?.readings[0]).toEqual({ key: "sliding", label: "↯", tps: 0, live: false })
+    expect(settled?.readings[1]!.label).toBe("μ")
+    expect(settled?.readings[1]!.tps).toBeCloseTo(111.1, 1)
+    // The resting figure is the primary: the gauge draws empty under it.
+    expect(settled?.primary).toBe(0)
+  })
+
+  test("window.hold true keeps a fresh session's sliding segment resting at zero", () => {
+    const view = display(createMeter(), T0, ["sliding"])
+    expect(view?.readings).toEqual([{ key: "sliding", label: "↯", tps: 0, live: false }])
+    expect(view?.live).toBe(false)
+    expect(view?.primary).toBe(0)
+  })
+
+  test("window.hold \"last\" holds the sliding reading after the stream stops", () => {
+    const opts: RateOptions = { ...DEFAULT_RATE, holdSliding: "last" }
+    const meter = createMeter(opts)
+    beginTurn(meter, T0, opts)
+    beginStep(meter, "msg", T0, T0)
+    const now = stream(meter, T0, 1_000, 400, opts)
+    const held = liveRate(meter, now, opts)! // the last live sliding figure
+    expect(held).toBeDefined()
+    endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100, opts) // 100 tokens in 1 s
+    const later = T0 + 1_100 + WINDOW + 100
+
+    const settled = display(meter, later, ["sliding", "cumulative"], opts)
     expect(settled?.live).toBe(false)
     expect(settled?.readings.map((reading) => reading.key)).toEqual(["sliding", "cumulative"])
     expect(settled?.readings.map((reading) => reading.live)).toEqual([false, false])
@@ -699,7 +741,7 @@ describe("display", () => {
     expect(settled?.readings.map((reading) => reading.label)).toEqual(["✓"])
   })
 
-  test("holding off leaves only the settled figure", () => {
+  test("window.hold false leaves only the settled figure", () => {
     const opts: RateOptions = { ...DEFAULT_RATE, holdSliding: false }
     const meter = createMeter(opts)
     beginTurn(meter, T0)
@@ -710,6 +752,15 @@ describe("display", () => {
     expect(settled?.readings.map((reading) => reading.key)).toEqual(["cumulative"])
     expect(settled?.readings[0]!.live).toBe(false)
     expect(settled?.readings[0]!.tps).toBeCloseTo(111.1, 1)
+  })
+
+  test("window.hold false drops the sliding segment entirely", () => {
+    const opts: RateOptions = { ...DEFAULT_RATE, holdSliding: false }
+    const meter = createMeter(opts)
+    const now = stream(meter, T0, 1_000, 400, opts)
+    expect(liveRate(meter, now, opts)).toBeDefined()
+    // The window has emptied and no settled figure exists: nothing to show.
+    expect(display(meter, now + WINDOW + 100, ["sliding"], opts)).toBeUndefined()
   })
 
   test("a new turn keeps both figures until something newer arrives", () => {

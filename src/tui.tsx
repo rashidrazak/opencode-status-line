@@ -19,16 +19,17 @@
  * The settled figure measures decode time: its span prefers the observed decode
  * clock, then the host's stream boundary (`session.step.streamed`, published
  * before tool settlement), so time a tool spent running is not charged. It
- * folds the whole turn (configurable) and the sliding reading holds its last
- * value once a stream stops (`window.hold`), so the line never loses its last
- * figure at the finish line. A session met without a meter
- * (a resume, a plugin reload) has its settled figure rebuilt from the last
- * turn's recorded messages, so the meter segment does not come back blank — it
- * shows the settled average over a resting `↯ 0.0` and an empty gauge. The
- * sliding window's samples are delta arrival times no record keeps, so a real
- * `↯` figure only returns with the next stream. The gauge stays on screen (it
- * holds the last reading once settled), figures are speed-coloured, and
- * `/opencode-status-line` shows the numbers behind them.
+ * folds the whole turn (configurable) and the sliding reading comes to rest
+ * once a stream stops — `window.hold: true` keeps it at a dimmed `0.0` over an
+ * empty gauge, `false` hides it, `"last"` keeps the last value — so the line
+ * keeps its shape without re-showing a figure nothing is producing. A session
+ * met without a meter (a resume, a plugin reload) has its settled figure
+ * rebuilt from the last turn's recorded messages, so the meter segment does not
+ * come back blank — it shows the settled average over a resting `↯ 0.0` and an
+ * empty gauge. The sliding window's samples are delta arrival times no record
+ * keeps, so a real `↯` figure only returns with the next stream. The gauge
+ * stays on screen while the sliding figure rests, figures are speed-coloured,
+ * and `/opencode-status-line` shows the numbers behind them.
  *
  * Configuration lives in `~/.config/opencode/opencode-status-line.json` and a
  * project's `.opencode-status-line.json` — see config.ts. The plugin lives in
