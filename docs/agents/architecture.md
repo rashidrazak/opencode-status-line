@@ -31,7 +31,7 @@ them verbatim, so keep that style.
 | --- | --- |
 | `src/tui.tsx` | Entry: event wiring, slot render, command. The only file importing `@opencode/plugin`, `solid-js`, or host APIs. |
 | `src/rate.ts` | Speed maths (sliding window, turn fold, calibration, history) and the `USAGE_LABELS` icon/word sets. Pure. |
-| `src/render.ts` | Gauge and context-bar geometry, run cutting and wrapping for narrow widths. Pure. |
+| `src/render.ts` | Gauge and context-bar geometry, the context/cache segment runs, run cutting and wrapping for narrow widths. Pure. |
 | `src/format.ts` | Token / money / duration formatting. Pure. |
 | `src/diff.ts` | Uncommitted-change totals from the host's VCS status, and the diff segment's cache policy. Pure. |
 | `src/guard.ts` | The render path's degradation policy: what a throwing step falls back to, and when the line gives up entirely. Pure but for an injected `warn`. |

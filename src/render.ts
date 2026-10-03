@@ -1,11 +1,13 @@
 /**
- * Presentation geometry for the line: the live eighth-cell speed gauge and the
- * context-window bar, as tone-tagged runs for the TUI to colour.
+ * Presentation geometry for the line: the live eighth-cell speed gauge, the
+ * context-window bar, and the context and cache segments, as tone-tagged runs
+ * for the TUI to colour.
  *
  * Pure and JSX-free, so the geometry can be asserted without a terminal:
  *
  *   bun test test/render.test.ts
  */
+import { cacheShare, compact, contextUsed, pressureTone, type TokenRecord } from "./format.ts"
 import { speedTone, type SpeedTone } from "./rate.ts"
 
 export type RunTone = "muted" | SpeedTone
@@ -206,6 +208,63 @@ export function gauge(
  */
 export function contextBar(ratio: number, width: number, tone: RunTone = "success"): Run[] {
   return barRuns(ratio, width, tone)
+}
+
+/** One run in the muted tone; the segment's figure tone does not apply. */
+export const muted = (text: string): Run => ({ text, tone: "muted" })
+
+/**
+ * The context segment's inputs: the newest usage-bearing request's record (or
+ * none yet), the model's declared window, and the bar's geometry and pressure
+ * thresholds (in percent, as configured).
+ */
+export interface ContextRunsInput {
+  tokens?: TokenRecord
+  /** The model's declared context window, where the catalogue declares one. */
+  limit?: number
+  /** Cells the bar draws. */
+  width: number
+  /** Fill turns yellow at this percent full. */
+  warnAt: number
+  /** Fill turns red at this percent full. */
+  dangerAt: number
+}
+
+/**
+ * The context segment: `█████▊····▏ 57% — 572.7k`, or the plain token count
+ * where the model's window is unknown. With no usage yet it draws the same
+ * shape at zero — an empty bar, `0%` and `0` — so a fresh session shows its
+ * full line from the first paint; the first usage-bearing message replaces
+ * the zeros on the next repaint. The reading is the newest request's own
+ * record, never the session record's cumulative totals, which sum every turn.
+ */
+export function contextRuns(input: ContextRunsInput): Run[] {
+  const used = contextUsed(input.tokens)
+  if (input.limit === undefined) return [muted(compact(used))]
+  const ratio = Math.min(1, used / input.limit)
+  const tone = pressureTone(ratio, input.warnAt / 100, input.dangerAt / 100)
+  return [
+    ...contextBar(ratio, input.width, tone),
+    { text: ` ${Math.round(ratio * 100)}%`, tone },
+    muted(" — "),
+    muted(compact(used)),
+  ]
+}
+
+/**
+ * The cache segment: its configured label, the share of the newest request's
+ * window read from cache, and the cached token count. With no reading yet it
+ * draws the same label at zero — `0.0% — 0` — rather than vanishing, so the
+ * line keeps its shape until the first usage arrives.
+ */
+export function cacheRuns(tokens: TokenRecord | undefined, label: string): Run[] {
+  const share = cacheShare(tokens)
+  return [
+    muted(`${label} `),
+    muted(`${((share ?? 0) * 100).toFixed(1)}%`),
+    muted(" — "),
+    muted(compact(tokens?.cache?.read ?? 0)),
+  ]
 }
 
 /** The leading drawing: the gauge, unless the style turns it off. */

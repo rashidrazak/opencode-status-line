@@ -21,6 +21,8 @@ Read before touching `src/rate.ts`, the meter/usage branches of
 - The session record (`data.session.get`) holds token totals cumulative across
   all turns. Context and cache must read the newest assistant message's own
   `tokens` (`windowInfo` in `src/tui.tsx`), or every prompt ever sent is counted.
+  Until one lands, both segments draw zero figures rather than vanishing
+  (`contextRuns`/`cacheRuns` in `src/render.ts`).
 - Exact token counts arrive only at `session.step.ended`; live figures are
   estimates from stream deltas, calibrated at that point. Prefer the server's
   `event.created` clock for step spans and fall back to local arrival times —

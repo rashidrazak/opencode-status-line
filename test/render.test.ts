@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import {
+  cacheRuns,
   columnWidth,
   contextBar,
+  contextRuns,
   cutRuns,
   dimRuns,
   gauge,
@@ -71,6 +73,44 @@ describe("contextBar", () => {
       expect(text(contextBar(ratio, 9))).toBe(text(gauge(ratio * 100, 100, 9, 0)))
     }
     expect(text(contextBar(1, 9))).toHaveLength(10)
+  })
+})
+
+describe("contextRuns", () => {
+  const input = { limit: 200_000, width: 10, warnAt: 70, dangerAt: 90 }
+
+  test("a fresh session draws an empty bar and zero figures", () => {
+    expect(text(contextRuns(input))).toBe("··········▏ 0% — 0")
+  })
+
+  test("an unknown window draws the plain zero", () => {
+    expect(contextRuns({ ...input, limit: undefined })).toEqual([{ text: "0", tone: "muted" }])
+  })
+
+  test("the newest record replaces the zeros in the usual form", () => {
+    const tokens = { input: 900, output: 600, reasoning: 100, cache: { read: 571_800, write: 400 } }
+    expect(text(contextRuns({ ...input, tokens, limit: 1_000_000 }))).toBe("█████▊····▏ 57% — 573.8k")
+  })
+
+  test("the pressure tone reads the thresholds as percents", () => {
+    const tokens = { input: 190_000 }
+    expect(contextRuns({ tokens, limit: 200_000, width: 4, warnAt: 90, dangerAt: 95 })[0]).toMatchObject({
+      tone: "error",
+    })
+  })
+})
+
+describe("cacheRuns", () => {
+  test("a fresh session draws its label and zero figures", () => {
+    expect(text(cacheRuns(undefined, "⧉"))).toBe("⧉ 0.0% — 0")
+  })
+
+  test("an empty record still draws the label and zero figures", () => {
+    expect(text(cacheRuns({}, "cache"))).toBe("cache 0.0% — 0")
+  })
+
+  test("a real record keeps the usual form", () => {
+    expect(text(cacheRuns({ input: 900, cache: { read: 900 } }, "⧉"))).toBe("⧉ 50.0% — 900")
   })
 })
 
