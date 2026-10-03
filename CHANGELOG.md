@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The plugin now identifies itself as `opencode-status-line`.** The old ID,
+  `local.opencode-status-line`, suggested a plugin loaded from a folder, but the
+  package is published to npm and the same ID is used however it was installed.
+  If you had disabled the plugin by ID — `"plugins":
+  ["-local.opencode-status-line"]` — write `"-opencode-status-line"` instead, or
+  it will load again. The commands (`/opencode-status-line`, `/tps`) and the
+  stats command's own ID are unchanged.
+
 ## [1.1.0] - 2026-10-03
 
 ### Changed
