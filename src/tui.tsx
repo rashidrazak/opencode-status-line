@@ -114,7 +114,7 @@ interface StoredMessage {
 type SessionLocation = { directory?: string | null; workspaceID?: string }
 
 export default Plugin.define({
-  id: "local.opencode-status-line",
+  id: "opencode-status-line",
   setup(context) {
     const directory =
       context.location?.directory ?? context.data.location.default()?.directory ?? process.cwd()
