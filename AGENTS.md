@@ -16,7 +16,8 @@ introduction; `MANUAL.md` is the exhaustive user reference.
   (or `bun test test/rate.test.ts` for one module) needs no install;
   `bun install && bun run typecheck` checks types, including `src/tui.tsx`,
   which no test imports; `npm run check:pack` checks the package surface,
-  including that the packed entry is the precompiled one. CI is
+  including that the packed entry is the precompiled one, but it does not build
+  — run `bun run build:entry` first on a checkout with no `dist/`. CI is
   `.github/workflows/ci.yml`; releases are `.github/workflows/publish.yml`, not
   a laptop. `main` takes pull requests only: green CI plus one approving
   review (the maintainer bypasses for their own work).
@@ -30,17 +31,20 @@ introduction; `MANUAL.md` is the exhaustive user reference.
   every other loader, and `bun build` proves nothing either way, because it
   reads file-relative tsconfigs a runtime import ignores. The tarball ships
   `tsconfig.json` too; only file-relative tooling reads it.
-- **`src/tui.tsx` is the plugin entry**, loaded straight from this checkout —
-  the live host's `~/.config/opencode/cli.json` lists the directory. OpenCode
+- **`src/tui.tsx` is the plugin entry**, loaded straight from this checkout
+  when `~/.config/opencode/cli.json` lists the directory. `opencode plugin
+  list` shows whether it is loaded — do not assume it is. While it is, OpenCode
   transpiles the TSX on load and hot-reloads on save, so a broken save shows up
   in the running TUI immediately. The plugin cannot run standalone; verify
   runtime changes by hand in a session (`/opencode-status-line` opens the stats
   dialog).
-- **The root `tui.tsx` is a load-bearing shim** re-exporting `src/tui.tsx`. The
-  running 2.0.16 loader resolves a directory plugin through `<dir>/tui` before
-  checking `package.json` exports; deleting the shim drops the plugin from the
-  live TUI. npm consumers resolve `@rashidrazak/opencode-status-line/tui`
-  through exports to the built `dist/tui.js` instead.
+- **The root `tui.tsx` is a load-bearing shim** re-exporting `src/tui.tsx`. On
+  the 2.0.16 loader, directory-plugin resolution looked for `<dir>/tui` before
+  `package.json` exports, and deleting the shim dropped the plugin from the
+  live TUI; the host here has since moved to 2.0.22 and removal has not been
+  re-verified, so keep it. npm consumers resolve
+  `@rashidrazak/opencode-status-line/tui` through exports to the built
+  `dist/tui.js` instead.
 - Internal imports carry `.ts`/`.tsx` extensions (`./rate.ts`); the host
   resolves them verbatim, so keep that style.
 
@@ -57,6 +61,8 @@ introduction; `MANUAL.md` is the exhaustive user reference.
 | `src/palette.ts` | The bundled colour palettes and palette/override resolution. Pure. |
 | `src/config.ts` | JSON config loader; pure except an injectable `read`. |
 | `scripts/build-entry.mjs` | Builds `dist/tui.js`, the entry npm consumers run, with OpenTUI's Solid transform and the runtime external; refuses to emit a bundle that still resolves its JSX runtime at load. |
+| `scripts/check-pack.mjs` | Inspects the npm tarball for CI's package job and `prepublishOnly`; Node built-ins only. |
+| `scripts/changelog-section.mjs` | Extracts a version's `CHANGELOG.md` section for the Release body; Node built-ins only. |
 | `dist/tui.js` | That build's output — gitignored, never committed, built by CI and `prepublishOnly`. |
 | `test/*.test.ts` | One per pure module. |
 | `tui.tsx` | Root shim re-exporting `src/tui.tsx`; see above. |
@@ -90,17 +96,18 @@ Keep new logic in the pure modules so it can be tested without a terminal.
 - A 250 ms ticker repaints only while a stream is active; a 1 s heartbeat keeps
   the elapsed timer and held figures repainting when nothing streams. Stop
   both in the cleanup function.
-- A draw step that can throw goes through a guard (`src/guard.ts`): a segment
-  through `segmentGuard.attempt`, a row through `rowGuard`, the box through
-  `boxGuard`, the colourizer through `inkGuard`. See *Failing safe* below.
+- A draw step that can throw goes through a guard (`src/guard.ts`): the row
+  build through `valueGuard`, a segment through `segmentGuard`, a row
+  renderable through `rowGuard`, the box through `boxGuard`, the colourizer
+  through `inkGuard`. See *Failing safe* below.
 
 ### Failing safe — the degradation ladder
 
 - Two calls, two kinds of failure. `attempt(build, fallback)` is for steps whose
   fallback still draws something — the renderer's default ink, a skipped
-  segment, the figures already on screen (`heldView`, dimmed by `dimRuns`) — and
-  never latches. `lastResort(build)` is for the renderables themselves, where a
-  throw leaves nothing to draw.
+  segment, the figures already on screen (`valueGuard`'s `heldView`, dimmed by
+  `dimRuns`) — and never latches. `lastResort(build)` is for the renderables
+  themselves, where a throw leaves nothing to draw.
 - **The latch is not tidiness.** OpenTUI keeps every native object (text
   buffer, span, syntax style) in one shared table of 65,534 handles, and a
   repaint that throws *after* allocating abandons its handles. A plugin that
@@ -325,6 +332,15 @@ CLI-only, so consumers add the package name to `cli.json`, never
 `opencode.json`. README links to files outside the tarball (`MANUAL.md`,
 `CONTRIBUTING.md`, `RELEASING.md`) must be absolute GitHub URLs — npm renders
 the README with none of the repository's files around it.
+
+## Commits and pull requests
+
+Commits follow Conventional Commits — `<type>(<scope>): <subject>`, imperative,
+lowercase, no trailing period; the types and scopes, plus the pre-PR checklist,
+are in `CONTRIBUTING.md`. One problem per PR; a change to `src/tui.tsx` needs a
+real session to prove it, because no test covers the event wiring. CI runs the
+suite on Linux, macOS and Windows, then typechecks, builds the entry and checks
+the tarball.
 
 ## Agent skills
 
