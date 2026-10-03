@@ -63,6 +63,118 @@ describe("sliding rate", () => {
   })
 })
 
+describe("sliding rate over sparse cadences", () => {
+  /**
+   * Drive the meter the way the ticker does: one-token deltas arrive on the
+   * cadence `nextGap` schedules and the line repaints every 250 ms. Returns
+   * the sliding reading each repaint showed, held figures included, so a test
+   * can compare what the user saw with the truth.
+   */
+  function repaint(
+    meter: Meter,
+    start: number,
+    durationMs: number,
+    nextGap: () => number,
+    opts: RateOptions = OPTS,
+  ): { tps: number; live: boolean }[] {
+    const readings: { tps: number; live: boolean }[] = []
+    let next = start
+    for (let now = start; now <= start + durationMs; now += 250) {
+      while (next <= now) {
+        observe(meter, next, 4, next, opts)
+        next += nextGap()
+      }
+      const reading = display(meter, now, ["sliding"], opts)?.readings[0]
+      if (reading) readings.push({ tps: reading.tps, live: reading.live })
+    }
+    return readings
+  }
+
+  const mean = (readings: { tps: number }[]): number =>
+    readings.reduce((sum, reading) => sum + reading.tps, 0) / readings.length
+
+  test("reads slow but regular streams at their true cadence", () => {
+    for (const [gap, truth] of [
+      [500, 2],
+      [1_000, 1],
+      [1_500, 2 / 3],
+      [2_000, 0.5],
+    ] as const) {
+      const readings = repaint(createMeter(), T0, 60_000, () => gap)
+      expect(readings.length).toBeGreaterThan(0)
+      expect(mean(readings)).toBeGreaterThan(truth * 0.9)
+      expect(mean(readings)).toBeLessThan(truth * 1.1)
+    }
+  })
+
+  test("shows nothing when deltas are 2.5 s or more apart", () => {
+    for (const gap of [2_500, 2_900, 3_500, 6_000, 30_000]) {
+      expect(repaint(createMeter(), T0, 60_000, () => gap)).toHaveLength(0)
+    }
+  })
+
+  test("never scores a lone post-silence delta as a speed", () => {
+    const meter = createMeter()
+    observe(meter, T0, 4)
+    observe(meter, T0 + WINDOW + 1_000, 4)
+    expect(liveRate(meter, T0 + WINDOW + 1_100)).toBeUndefined()
+    expect(display(meter, T0 + WINDOW + 1_100, ["sliding"])).toBeUndefined()
+  })
+
+  test("keeps fast streams at their pace", () => {
+    const readings = repaint(createMeter(), T0, 60_000, () => 100)
+    expect(Math.abs(mean(readings) / 10 - 1)).toBeLessThan(0.03)
+  })
+
+  test("a stopped burst decays and never re-inflates the held figure", () => {
+    const meter = createMeter()
+    // 20 tokens in one second: nine 8-char deltas, then the tenth at the tick.
+    for (let index = 0; index < 9; index++) observe(meter, T0 + 100 + index * 100, 8)
+    const readings = repaint(meter, T0 + 1_000, 6_000, () => Number.POSITIVE_INFINITY)
+    const live = readings.filter((reading) => reading.live)
+    expect(live.length).toBeGreaterThan(1)
+    for (let index = 1; index < live.length; index++) {
+      expect(live[index]!.tps).toBeLessThanOrEqual(live[index - 1]!.tps)
+    }
+    const behind = readings.filter((reading) => !reading.live)
+    expect(behind.length).toBeGreaterThan(0)
+    const lastLive = live[live.length - 1]!.tps
+    for (const reading of behind) expect(reading.tps).toBeLessThanOrEqual(lastLive)
+  })
+
+  test("tracks jittered delivery instead of piling up the gaps", () => {
+    // A linear congruential generator keeps the cadence jitter deterministic.
+    const jitter = (baseMs: number, seed: number) => {
+      let state = seed >>> 0
+      const random = () => {
+        state = (state * 1_664_525 + 1_013_904_223) >>> 0
+        return state / 4_294_967_296
+      }
+      const gap = () => Math.max(50, Math.round(baseMs * (1 - 0.3 + 0.6 * random())))
+      const meter = createMeter()
+      let next = T0 + gap()
+      let tokens = 0
+      const readings: { tps: number; live: boolean }[] = []
+      for (let now = T0; now <= T0 + 60_000; now += 250) {
+        while (next <= now) {
+          observe(meter, next, 4, next)
+          tokens += 1
+          next += gap()
+        }
+        const reading = display(meter, now, ["sliding"])?.readings[0]
+        if (reading) readings.push({ tps: reading.tps, live: reading.live })
+      }
+      return { truth: tokens / 60, mean: mean(readings) }
+    }
+    for (const seed of [7, 11]) {
+      const fast = jitter(1_000, seed)
+      expect(Math.abs(fast.mean / fast.truth - 1)).toBeLessThan(0.1)
+      const slow = jitter(2_000, seed)
+      expect(Math.abs(slow.mean / slow.truth - 1)).toBeLessThan(0.25)
+    }
+  })
+})
+
 describe("cumulative rate", () => {
   test("per step when folding is off", () => {
     const opts: RateOptions = { ...DEFAULT_RATE, turnFold: false }
