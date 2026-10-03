@@ -21,18 +21,20 @@
     "status-line"
   ],
   "exports": {
-    "./tui": "./src/tui.tsx"
+    "./tui": "./dist/tui.js"
   },
   "files": [
     "src",
+    "dist",
     "assets",
     "tsconfig.json"
   ],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "build:entry": "bun scripts/build-entry.mjs",
     "check:pack": "node scripts/check-pack.mjs",
-    "prepublishOnly": "bun test && node scripts/check-pack.mjs"
+    "prepublishOnly": "bun run build:entry && bun test && node scripts/check-pack.mjs"
   },
   "publishConfig": {
     "access": "public"

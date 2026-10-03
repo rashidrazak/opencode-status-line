@@ -8,6 +8,35 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- The npm entry is now built rather than transpiled on load. `bun run
+  build:entry` compiles `src/tui.tsx` with OpenTUI's own Solid plugin into
+  `dist/tui.js`, which imports `@opentui/solid` by name and leaves the host's
+  runtime external; `exports` and `files` point npm consumers at it. A package
+  install no longer compiles the JSX at load against a runtime OpenCode did not
+  build — the mismatch behind the `Failed to create TextBuffer` crashes and the
+  native-handle leak that filled the renderer's table. A checkout install is
+  unchanged: the directory path still runs `src/tui.tsx`, which OpenCode
+  transforms itself. CI builds the entry before checking the tarball, and
+  `check:pack` now also refuses a tarball whose packed entry resolves its JSX
+  runtime at load.
+
+### Fixed
+
+- A drawing step that throws no longer costs the whole line — and with it the
+  session. Each step now degrades on its own: an ink that cannot be resolved
+  draws the run in the terminal's default colour, a segment whose data cannot
+  be read is skipped while the rest of the line stays, a row that cannot be
+  built is drawn as plain text, and a build that fails holds the figures it
+  drew last (dimmed, to say they are not from this paint) and tries again on
+  the next paint. When nothing at all can be drawn the line shows a muted `⚠`.
+  After three consecutive failures of the renderables themselves it stops
+  trying and logs a single warning: an OpenTUI repaint that throws after
+  allocating abandons its native objects, so a host that cannot draw the line
+  would otherwise exhaust the renderer's 65,534-handle pool and take the TUI
+  down minutes later with `Failed to create TextBuffer`.
+
 ## [1.0.2] - 2026-10-02
 
 ### Fixed

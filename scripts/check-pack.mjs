@@ -12,12 +12,19 @@
  *   - the root `tui.tsx` shim must stay out — npm consumers resolve the entry
  *     through the `exports` map, and the shim would shadow it at the root of
  *     the installed package;
- *   - every target of the `exports` map must exist in the tarball.
+ *   - every target of the `exports` map must exist in the tarball;
+ *   - that target must be the precompiled `dist/tui.js`. A TSX entry is
+ *     compiled at load, against a runtime the host does not share, which is the
+ *     2026-10-03 crash; the built entry imports `@opentui/solid` by name
+ *     instead (AGENTS.md, *The npm entry is built*).
  *
  * Node built-ins only: `npm pack --dry-run --json` and `git ls-files`.
  */
 import { execFileSync } from "node:child_process"
 import { readFileSync } from "node:fs"
+
+/** What npm consumers run; see `scripts/build-entry.mjs`. */
+const ENTRY = "dist/tui.js"
 
 const run = (command, args) =>
   execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] })
@@ -54,6 +61,11 @@ for (const file of ["package.json", "README.md", "LICENSE"]) {
   if (!packed.has(file)) problems.push(`${file} is missing from the tarball`)
 }
 
+const entryMissing = !packed.has(ENTRY)
+if (entryMissing) {
+  problems.push(`${ENTRY} is missing from the tarball — run \`bun run build:entry\` before packing`)
+}
+
 const exportTargets = []
 const collectTargets = (value) => {
   if (typeof value === "string") exportTargets.push(value)
@@ -62,7 +74,18 @@ const collectTargets = (value) => {
 for (const value of Object.values(pkg.exports ?? {})) collectTargets(value)
 for (const target of exportTargets) {
   const path = target.replace(/^\.\//, "")
+  // The entry has its own rule above, with the fix in the message.
+  if (entryMissing && path === ENTRY) continue
   if (!packed.has(path)) problems.push(`exports points at ${path}, which is not in the tarball`)
+}
+
+if (!entryMissing) {
+  const built = readFileSync(ENTRY, "utf8")
+  if (built.includes("@jsxImportSource") || built.includes("@opentui/solid/jsx-runtime")) {
+    problems.push(`${ENTRY} still resolves its JSX runtime at load — it is not a precompiled entry`)
+  } else if (!/from\s*"@opentui\/solid"/.test(built)) {
+    problems.push(`${ENTRY} does not import @opentui/solid by name — it is not a precompiled entry`)
+  }
 }
 
 if (problems.length > 0) {

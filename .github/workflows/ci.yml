@@ -52,14 +52,21 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      # src/tui.tsx is the entry the tests never import; transpiling it with
-      # every import external catches syntax errors the suite cannot see.
-      - name: Transpile the entry
-        run: bun build src/tui.tsx --target=bun --outfile "$RUNNER_TEMP/tui-check.js" --external '*'
+      # The build compiles the entry's JSX with OpenTUI's own Solid plugin, so
+      # it needs the development install the lockfile pins.
+      - name: Install the development dependencies
+        run: bun install --frozen-lockfile
+
+      # npm consumers run the built entry, never the TSX: the host hands its
+      # Solid runtime to plugin TSX outside node_modules alone (AGENTS.md, *The
+      # npm entry is built*). Building is also the syntax check the suite cannot
+      # give this file — no test imports src/tui.tsx.
+      - name: Build the npm entry
+        run: bun run build:entry
 
       # The tarball is what npm consumers install: every tracked file under
-      # src/ must be in it, nothing untracked may slip in, and the exports map
-      # must point at a packed file.
+      # src/ must be in it, nothing untracked may slip in, the exports map must
+      # point at a packed file, and that file must be the precompiled entry.
       - name: Check the npm tarball
         run: node scripts/check-pack.mjs
 

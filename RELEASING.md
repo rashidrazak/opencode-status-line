@@ -29,8 +29,8 @@ npm requires it to configure trusted publishers.
    npm publish
    ```
 
-   `prepublishOnly` runs the suite and `check-pack` first, so a broken tree
-   cannot ship.
+   `prepublishOnly` builds the npm entry, then runs the suite and `check-pack`,
+   so a broken tree — or an unbuilt one — cannot ship.
 
 2. **Trust this repository** on npmjs.com: *package → Settings → Trusted
    Publisher → Add trusted publisher → GitHub Actions*:

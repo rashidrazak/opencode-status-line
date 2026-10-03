@@ -6,24 +6,29 @@ introduction; `MANUAL.md` is the exhaustive user reference.
 
 ## What is unusual here
 
-- **No build step.** `package.json` publishes the source (`./tui` →
-  `src/tui.tsx`) and OpenCode transpiles it on load; don't add a bundler, and
-  keep `src/` the only shipped surface — `bun.lock` exists solely so the
-  typecheck job resolves the host and Solid types reproducibly. `bun test` (or
-  `bun test test/rate.test.ts` for one module) needs no install;
+- **The npm entry is built; the checkout is not.** `src/tui.tsx` stays the
+  source of truth and a directory install loads it as TSX, transpiled by the
+  host. npm consumers get `dist/tui.js`, which `bun run build:entry` produces
+  with OpenTUI's own Solid plugin and the host's runtime left external — *The
+  npm entry is built* below carries the argument, and it is not optional.
+  `dist/` is gitignored: CI and `prepublishOnly` each build the checkout they
+  are about to check or publish, so the artifact cannot go stale. `bun test`
+  (or `bun test test/rate.test.ts` for one module) needs no install;
   `bun install && bun run typecheck` checks types, including `src/tui.tsx`,
-  which no test imports; `npm run check:pack` checks the package surface. CI is
+  which no test imports; `npm run check:pack` checks the package surface,
+  including that the packed entry is the precompiled one. CI is
   `.github/workflows/ci.yml`; releases are `.github/workflows/publish.yml`, not
   a laptop. `main` takes pull requests only: green CI plus one approving
   review (the maintainer bypasses for their own work).
-- **The entry's JSX pragma is load-bearing.** `src/tui.tsx` opens with
-  `/** @jsxImportSource @opentui/solid */`. OpenCode imports the published TSX
-  with a runtime `import()`, and Bun resolves runtime JSX from the project,
-  never from the package's own `tsconfig.json`; without the pragma an npm
-  install compiles the entry against React and dies with `Cannot find package
-  'react'`. The checkout hides this — the host's Solid transform covers TSX
-  outside `node_modules` — and `bun build` proves nothing, because it reads
-  file-relative tsconfigs the runtime ignores. The tarball ships
+- **The entry's JSX pragma is still load-bearing.** `src/tui.tsx` opens with
+  `/** @jsxImportSource @opentui/solid */`. Any loader that transpiles the TSX
+  without the host's Solid transform resolves `@opentui/solid/jsx-runtime`
+  against the file's own location, and without the pragma that is React and the
+  install dies with `Cannot find package 'react'` (that was 1.0.2). The
+  *published* entry no longer depends on it — the build precompiles the JSX and
+  imports `@opentui/solid` by name — but keep it first: it names the runtime for
+  every other loader, and `bun build` proves nothing either way, because it
+  reads file-relative tsconfigs a runtime import ignores. The tarball ships
   `tsconfig.json` too; only file-relative tooling reads it.
 - **`src/tui.tsx` is the plugin entry**, loaded straight from this checkout —
   the live host's `~/.config/opencode/cli.json` lists the directory. OpenCode
@@ -34,8 +39,8 @@ introduction; `MANUAL.md` is the exhaustive user reference.
 - **The root `tui.tsx` is a load-bearing shim** re-exporting `src/tui.tsx`. The
   running 2.0.16 loader resolves a directory plugin through `<dir>/tui` before
   checking `package.json` exports; deleting the shim drops the plugin from the
-  live TUI. npm consumers resolve `@rashidrazak/opencode-status-line/tui` through exports to
-  `src/tui.tsx` instead.
+  live TUI. npm consumers resolve `@rashidrazak/opencode-status-line/tui`
+  through exports to the built `dist/tui.js` instead.
 - Internal imports carry `.ts`/`.tsx` extensions (`./rate.ts`); the host
   resolves them verbatim, so keep that style.
 
@@ -48,8 +53,11 @@ introduction; `MANUAL.md` is the exhaustive user reference.
 | `src/render.ts` | Gauge and context-bar geometry, run cutting and wrapping for narrow widths. Pure. |
 | `src/format.ts` | Token / money / duration formatting. Pure. |
 | `src/diff.ts` | Uncommitted-change totals from the host's VCS status, and the diff segment's cache policy. Pure. |
+| `src/guard.ts` | The render path's degradation policy: what a throwing step falls back to, and when the line gives up entirely. Pure but for an injected `warn`. |
 | `src/palette.ts` | The bundled colour palettes and palette/override resolution. Pure. |
 | `src/config.ts` | JSON config loader; pure except an injectable `read`. |
+| `scripts/build-entry.mjs` | Builds `dist/tui.js`, the entry npm consumers run, with OpenTUI's Solid transform and the runtime external; refuses to emit a bundle that still resolves its JSX runtime at load. |
+| `dist/tui.js` | That build's output — gitignored, never committed, built by CI and `prepublishOnly`. |
 | `test/*.test.ts` | One per pure module. |
 | `tui.tsx` | Root shim re-exporting `src/tui.tsx`; see above. |
 
@@ -60,9 +68,9 @@ Keep new logic in the pure modules so it can be tested without a terminal.
 ### Entry rules — every edit to `src/tui.tsx`
 
 - Keep the file's first line `/** @jsxImportSource @opentui/solid */`. The
-  published entry is transpiled at runtime, where the packed `tsconfig.json`
-  is never read; without the pragma npm installs fail with `Cannot find
-  package 'react'` (see *What is unusual here*).
+  checkout path is transpiled by whatever loads it, and a loader without the
+  host's Solid transform compiles the JSX against React without the pragma
+  (`Cannot find package 'react'`, see *What is unusual here*).
 - Register the keymap layer inside the `app` slot's `render`, never directly in
   `setup`: v2 keeps the keymap provider in the component tree, so a `setup`
   registration throws `Keymap.Provider is missing` and kills the plugin. Give
@@ -82,6 +90,102 @@ Keep new logic in the pure modules so it can be tested without a terminal.
 - A 250 ms ticker repaints only while a stream is active; a 1 s heartbeat keeps
   the elapsed timer and held figures repainting when nothing streams. Stop
   both in the cleanup function.
+- A draw step that can throw goes through a guard (`src/guard.ts`): a segment
+  through `segmentGuard.attempt`, a row through `rowGuard`, the box through
+  `boxGuard`, the colourizer through `inkGuard`. See *Failing safe* below.
+
+### Failing safe — the degradation ladder
+
+- Two calls, two kinds of failure. `attempt(build, fallback)` is for steps whose
+  fallback still draws something — the renderer's default ink, a skipped
+  segment, the figures already on screen (`heldView`, dimmed by `dimRuns`) — and
+  never latches. `lastResort(build)` is for the renderables themselves, where a
+  throw leaves nothing to draw.
+- **The latch is not tidiness.** OpenTUI keeps every native object (text
+  buffer, span, syntax style) in one shared table of 65,534 handles, and a
+  repaint that throws *after* allocating abandons its handles. A plugin that
+  retries every repaint therefore exhausts the pool and kills the TUI minutes
+  later with `Failed to create TextBuffer` (`role=cli`) — the message names
+  whatever allocation happened to be next, not the cause. So `lastResort`
+  counts consecutive failures, latches shut at three, and stops building
+  anything at all; only a plugin reload clears it.
+- The guards are per step on purpose: a colourizer that cannot resolve a theme
+  must not latch the tree away, and vice versa. A guard's `attempt` fallback
+  must not throw — keep them constants, stored values or pure string joins;
+  anything that builds renderables belongs in `lastResort`.
+- Build a row's parts **eagerly inside the guarded function** (`richRow`), not
+  in the host's lazy children getters: `Show` and `For` call their children
+  later, so a renderable that throws there throws in the host's reconciler,
+  where this plugin never sees it and no latch can stop the retries. That is
+  also why `<text>` nodes are built by `textLine`/`clickLine` rather than
+  inline in JSX.
+- `spans()` falls back to the row's plain text and `toneColor` to `undefined`
+  ink, so a colourizer that throws costs colour, not the line — the whole point
+  of the ladder is that a missing line is the last resort, not the first
+  symptom.
+- When every segment fails the line draws a single muted `⚠` instead of
+  nothing: a host API that is gone should be visible, not silent.
+- Honest limit: a throw from inside the *host's* reconciliation of our tree
+  cannot be caught from here. The ladder covers everything on this side of that
+  boundary, which is why the eager-parts rule above matters.
+
+### npm installs: why the entry is built
+
+Measured in the host's npm cache
+(`~/.cache/opencode/npm/<name>@<spec>/<ts>/`), whose root `package.json` pins
+just our package and whose lockfile answers *why* something landed:
+
+- `@opentui/core`, `@opentui/solid`, `solid-js` and `babel-preset-solid` are
+  installed at **0.5.14**, all marked `"peer": true` — npm auto-installed them
+  because `package.json` declares them as peers **without**
+  `peerDependenciesMeta`. Nothing else in that tree asks for them:
+  `@opencode/plugin` marks all of them optional. The repo's own copies are
+  0.5.12, the host's runtime is older still, so a package install runs the
+  entry's JSX against a runtime the host did not build.
+- A **working** npm TUI plugin (`opencode-cmd-provider@2.2.0`) declares those
+  same packages as plain `dependencies` and its tree carries its own 0.5.14
+  copies — so a second copy alone is not fatal, and neither is the version: what
+  separates the two is *how the runtime is referenced*, below.
+- The host binary's Solid transform carries the filter
+  `^(?!.*[/\\]node_modules[/\\]).*\.[cm]?[jt]sx(?:[?#].*)?$` right beside
+  `bun-plugin-solid` and `@opentui/solid`'s `runtime-plugin-support`: the host
+  transpiles plugin TSX **outside `node_modules`** itself and gives it its own
+  runtime, and leaves package-installed TSX to Bun, which compiles it against
+  the entry's `@jsxImportSource` pragma and resolves that runtime from the
+  installed tree.
+- That reading explains every observation at once: a **directory** install
+  shares the host's runtime (works); a **package** install runs the entry on its
+  own copy of `@opentui/solid`/`solid-js` — 0.5.14, beside a host runtime it was
+  not built with — which is where a render throws and abandons handles per
+  repaint; and removing the copies is **not** a fix. With optional peers the
+  host logs
+  `plugin operation failed … stage=load error="Cannot find package '@opentui/solid' imported from …/src/tui.tsx"`
+  and the plugin never loads at all (measured 2026-10-03T05:46:16Z in
+  `~/.local/share/opencode/log/opencode.log`) — the peers are what make the
+  entry loadable in the first place.
+- The npm TUI plugin known to work (`opencode-cmd-provider`) ships a prebuilt
+  `dist/`: measured, its `dist/tui.js` imports `@opentui/solid` **by name** and
+  contains no `jsx-runtime` reference at all. That is the shape this package
+  ships now — `bun run build:entry` compiles `src/tui.tsx` with OpenTUI's own
+  Bun plugin (`generate: "universal"`, `moduleName: "@opentui/solid"`), leaves
+  the host's runtime external, and writes the single `dist/tui.js` that
+  `exports` points at. A prebuilt entry is transformed by nobody at load, so no
+  loader resolves a runtime for it: its JSX is already `createComponent`/
+  `insert` calls beside a plain import declaration.
+- The build refuses to emit a bundle that still leans on
+  `@opentui/solid/jsx-runtime` or `@jsxImportSource`, and `check:pack` refuses a
+  tarball whose packed entry does either. Those two checks are what stop the
+  crash from returning by a silent regression; `prepublishOnly` and CI each run
+  the build before checking the tarball, and `dist/` is gitignored so there is
+  no committed artifact to go stale. The directory path is untouched: the root
+  shim still re-exports the TSX, which the host transforms itself.
+- Reproduce an install story in the host, never in a bundler: `.handle-probe/`
+  has the probe and its recipe, `stage=load` failures land in the host log, and
+  `bun build` proves nothing about either path.
+- `console.warn` from a plugin does **not** reach the host log (measured: the
+  log holds only ERROR/WARN/INFO lines from the host itself), so the guards'
+  warnings are for a developer watching the terminal — the user-visible signals
+  are the `⚠`, the uncoloured line and the dimmed held figures.
 
 ### Speed maths and the session record
 
@@ -198,8 +302,9 @@ merges across config sources like `padding`.
 ## Publishing
 
 `npm run check:pack` inspects the tarball — every tracked `src/` file packed,
-nothing untracked in, no root shim, every `exports` target present — and CI
-runs it on every pull request. `.github/workflows/publish.yml` runs on a pushed
+nothing untracked in, no root shim, every `exports` target present and
+precompiled — and CI runs it on every pull request, after `bun run build:entry`.
+`.github/workflows/publish.yml` runs on a pushed
 `v*` tag and on a published Release: it publishes with npm trusted publishing
 (OIDC, `id-token: write`) — no `NPM_TOKEN`, provenance automatic — and creates
 the GitHub Release from the version's `CHANGELOG.md` section, checked before

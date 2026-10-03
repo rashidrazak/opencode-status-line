@@ -84,6 +84,11 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      # `prepublishOnly` builds the entry npm consumers run, and the build
+      # needs OpenTUI's Solid plugin from the locked development install.
+      - name: Install the development dependencies
+        run: bun install --frozen-lockfile
+
       - name: Run the test suite
         run: bun test
 

@@ -29,6 +29,16 @@ export function hostRuns(runs: readonly Run[]): Run[] {
   return runs.map((run) => ({ ...run, host: true }))
 }
 
+/**
+ * The runs in the muted shade of their tone, the way a held figure draws. Used
+ * when a paint fails and the line holds the figures already on screen: the
+ * numbers stay readable and their dimness says they are not from this paint.
+ * Copies, so the caller's runs stay untouched.
+ */
+export function dimRuns(runs: readonly Run[]): Run[] {
+  return runs.map((run) => ({ ...run, dim: true }))
+}
+
 /** How the gauge is chosen; `auto` is the historical alias for `gauge`. */
 export type CapStyle = "auto" | "gauge" | "none"
 

@@ -33,9 +33,10 @@
  * OpenCode transpiles the TSX on load and resolves the imports itself.
  */
 import { Plugin } from "@opencode/plugin/tui"
-import { For, Show, createMemo, createSignal } from "solid-js"
+import { For, Show, createMemo, createSignal, type JSX } from "solid-js"
 import { contextBarWidth, loadConfig, rateOptions, resolvedPadding, segmentsFor, sharesHostRow, stackFor, type Config, type Surface, type UsageSegment } from "./config.ts"
 import { diffDue, diffKey, diffParts, diffTotals, type DiffReading, type DiffStat, type StatusFile } from "./diff.ts"
+import { createGuard } from "./guard.ts"
 import { HOST_PALETTE, inkColor, resolvePalette } from "./palette.ts"
 import type { Display, Meter } from "./rate.ts"
 import {
@@ -57,7 +58,7 @@ import {
   tpsStats,
   USAGE_LABELS,
 } from "./rate.ts"
-import { columnWidth, contextBar, cutRuns, gaugeFor, hostRuns, joinedWidth, wrapRows, type CapInput, type Run, type RunTone } from "./render.ts"
+import { columnWidth, contextBar, cutRuns, dimRuns, gaugeFor, hostRuns, joinedWidth, wrapRows, type CapInput, type Run, type RunTone } from "./render.ts"
 import { cacheShare, compact, contextUsed, duration, money, pressureTone, shellsLabel, type TokenRecord } from "./format.ts"
 
 /** How often the line redraws while something is on screen. */
@@ -340,16 +341,37 @@ export default Plugin.define({
     ]
 
     /**
+     * The guards that keep a throwing step from costing the line. Each one owns
+     * one kind of draw step, so a failure in the colours cannot latch the tree
+     * away and vice versa; see guard.ts for the policy and why the latch is
+     * what stops a broken install from leaking the host's native handles.
+     *
+     * `inkGuard` covers everything the colourizer touches — the palette, the
+     * tone overrides and the host's theme tokens — which is the step most
+     * likely to fail when the plugin and the host do not share a runtime. Its
+     * fallback is the renderer's own ink: the text still draws.
+     */
+    const inkGuard = createGuard({ label: "the colours" })
+    const segmentGuard = createGuard({ label: "a segment" })
+
+    /**
      * A run's colour: the tone at full strength while live, muted once
      * settled. With `colors.enabled` off, tones are ignored and the line
      * takes the body and muted inks alone. A run marked `host` — its segment
      * is excluded from the palette — draws from the OpenCode theme instead,
      * overrides and all.
+     *
+     * A colourizer that throws costs the line its colour, not its text: an
+     * uncoloured line is still a line, and a missing one is not.
      */
     const toneColor = (tone: RunTone | undefined, muted: boolean, host = false): string | undefined =>
-      host
-        ? inkColor(config.colors ? tone : undefined, muted, undefined, {}, context.theme.text)
-        : inkColor(config.colors ? tone : undefined, muted, palette, config.toneOverrides, context.theme.text)
+      inkGuard.attempt(
+        () =>
+          host
+            ? inkColor(config.colors ? tone : undefined, muted, undefined, {}, context.theme.text)
+            : inkColor(config.colors ? tone : undefined, muted, palette, config.toneOverrides, context.theme.text),
+        () => undefined,
+      )
 
     /** Settings for the gauge: the session's high-water mark sets its scale. */
     const capInput = (view: Display, each: Meter): CapInput => ({
@@ -551,34 +573,59 @@ export default Plugin.define({
       const session = sessionUsage(sessionID)
       const window = windowInfo(sessionID)
       const limit = contextLimit(window.model ?? session?.model)
-      const rows: Run[][] = []
-      for (const segment of segments) {
-        let part: Run[] = []
-        if (segment === "shells") part = shellRuns(sessionID)
-        else if (segment === "context") part = contextRuns(window.tokens, limit)
-        else if (segment === "cache") part = cacheRuns(window.tokens)
-        else if (segment === "meter") {
+
+      /** One segment's runs, before the exclusion mark. */
+      const partFor = (segment: UsageSegment): Run[] => {
+        if (segment === "shells") return shellRuns(sessionID)
+        if (segment === "context") return contextRuns(window.tokens, limit)
+        if (segment === "cache") return cacheRuns(window.tokens)
+        if (segment === "meter") {
           const found = meters.get(sessionID)
           // A session with no meter has met this generation mid-history — a
           // resume, a reload: rebuild its last figure from the records. The
           // seed repaints when it lands; this paint shows the other segments.
           if (!found) void seedMeter(sessionID)
           const view = found ? display(found, now, config.readings, opts, labels) : undefined
-          if (found && view) part = meterRuns(view, found)
-        } else if (segment === "cost") part = costRuns(session)
-        else if (segment === "time") part = timeRuns(session, now)
-        else if (segment === "diff") {
+          return found && view ? meterRuns(view, found) : []
+        }
+        if (segment === "cost") return costRuns(session)
+        if (segment === "time") return timeRuns(session, now)
+        if (segment === "diff") {
           const location = sessionLocation(sessionID)
           const key = diffKey(location)
           const reading = diffs.get(key)
           if (diffDue(reading, now, config.diffRefreshMs)) refreshDiff(key, location)
-          if (reading) part = diffRuns(reading.stat)
+          return reading ? diffRuns(reading.stat) : []
         }
+        return []
+      }
+
+      const rows: Run[][] = []
+      let drawn = 0
+      let lost = 0
+      for (const segment of segments) {
+        // A segment that throws costs that segment alone: the rest of the line
+        // is still worth drawing, and a bug in the shells count must not take
+        // the speed meter down with it.
+        let failed = false
+        const part = segmentGuard.attempt(
+          () => partFor(segment),
+          () => {
+            failed = true
+            return []
+          },
+        )
+        if (failed) lost += 1
         if (part.length === 0) continue
+        drawn += 1
         // An excluded segment always draws in the host theme: mark its runs
         // before they reach the colourizer.
         rows.push(config.excludeSegments.includes(segment) ? hostRuns(part) : part)
       }
+      // Every segment failed — a host API the line depends on is gone, not one
+      // reading that has yet to arrive. Draw the failure rather than nothing:
+      // a line that admits something is wrong beats a line that vanishes.
+      if (drawn === 0 && lost > 0) rows.push([{ text: "⚠", tone: "muted" }])
       return rows
     }
 
@@ -679,7 +726,6 @@ export default Plugin.define({
       const sharesRow = sharesHostRow(surface)
       // The placement's own segment list, or the shared `usage.segments`.
       const segments = segmentsFor(config, surface)
-      let warned = false
       /**
        * The width the host actually dealt this box, reported by layout. A
        * footer row shares its width with the host's own content, so the
@@ -687,11 +733,46 @@ export default Plugin.define({
        */
       const [fitted, setFitted] = createSignal<number | undefined>(undefined)
       /**
-       * Everything drawn is rebuilt inside this memo. The parts must not be a
-       * plain array computed in the component body: `Show` calls its children
-       * untracked, so a static build is evaluated once and then frozen — the
-       * symptom being a line that never repaints. A memo re-reads `version()`
-       * (deltas and the ticker) and every repaint gets fresh readings.
+       * The guards that own this placement's tree. `valueGuard` covers the row
+       * build — its fallback is the figures already on screen — while
+       * `rowGuard` and `boxGuard` cover the renderables themselves, where a
+       * throw leaves nothing to draw at all and every further attempt would
+       * abandon another set of the host's native objects. Only those two latch.
+       * See guard.ts for the policy and the reason it exists.
+       */
+      const valueGuard = createGuard({ label: "the figures" })
+      const rowGuard = createGuard({ label: "a row", advice: "restart OpenCode" })
+      const boxGuard = createGuard({ label: "the line box", advice: "restart OpenCode" })
+      /** An empty line: no session, nothing to draw, or a latch. */
+      const emptyView = (): { lines: RowView[]; basis: number } => ({ lines: [], basis: 0 })
+      /**
+       * The last rows this placement actually drew, and for which session. A
+       * build that throws holds them rather than blanking the line, dimmed so
+       * the freeze is visible; they are dropped the moment the session changes,
+       * because figures from another conversation are worse than none.
+       */
+      let held: { sessionID: string; lines: RowView[]; basis: number } | undefined
+      /** Latched shut: nothing can be drawn, so nothing is built or retried. */
+      const dead = () => rowGuard.broken || boxGuard.broken
+      /** The held rows, dimmed; empty when this session has none. */
+      const heldView = (sessionID: string): { lines: RowView[]; basis: number } => {
+        if (!held || held.sessionID !== sessionID) return emptyView()
+        return {
+          basis: held.basis,
+          lines: held.lines.map((row) => ({
+            before: dimRuns(row.before),
+            clickable: row.clickable ? dimRuns([row.clickable])[0] : undefined,
+            after: dimRuns(row.after),
+          })),
+        }
+      }
+      /**
+       * Everything drawn is rebuilt through this build, inside the memo below.
+       * The parts must not be a plain array computed in the component body:
+       * `Show` calls its children untracked, so a static build is evaluated
+       * once and then frozen — the symptom being a line that never repaints. A
+       * memo re-reads `version()` (deltas and the ticker) and every repaint gets
+       * fresh readings.
        *
        * A sidebar surface stacks the segments, one per row, each cut to the
        * column's width. A row surface joins the segments across one line and
@@ -702,77 +783,146 @@ export default Plugin.define({
        *
        * A run with `onClick` is hoisted out of the plain text into its own
        * `<text>`: mouse handlers live on renderables, and a `span` is not one.
-       *
-       * The try/catch is the same insurance as `safely`: a bug here must dim a
-       * line, not break a session.
        */
-      const view = createMemo<{ lines: RowView[]; basis: number }>(() => {
-        try {
-          // The heartbeat's clock: held figures and the elapsed timer repaint
-          // even while nothing is streaming.
-          version()
-          // Slots such as `prompt.footer` carry no session in their input; the
-          // route knows which conversation is on screen. Without one — the
-          // home screen, a plugin page — the line stays hidden rather than
-          // describing a conversation that is not open.
-          const sessionID = input?.sessionID ?? currentSession()
-          if (!sessionID) return { lines: [], basis: 0 }
-          const rows = usageRows(segments, sessionID, Date.now())
-          if (rows.length === 0) return { lines: [], basis: 0 }
-          const viewport = (context as { renderer?: { width?: number } }).renderer?.width
-          const window = typeof viewport === "number" && viewport > 0 ? viewport : undefined
-          const lines: Run[][] = []
-          if (stack === "column") {
-            for (const runs of rows) {
-              // A sidebar column is cut to its width with the padding kept in
-              // reserve, so configured padding cannot push it past the edge.
-              const room =
-                window !== undefined
-                  ? Math.max(1, columnWidth(window) - padding.left - padding.right)
-                  : undefined
-              lines.push(room !== undefined ? cutRuns(runs, room) : runs)
-            }
-          } else {
-            // A row fits itself to the width its box was actually dealt.
-            // `renderer.width` is the window and would overstate a footer row
-            // shared with the host's own content, so prefer the box's own
-            // laid-out width, measured after the first paint; the renderer
-            // covers the paint before that measurement exists.
-            const measured = fitted()
-            const granted = measured !== undefined && measured > 0 ? measured : window
+      const buildView = (sessionID: string): { lines: RowView[]; basis: number } => {
+        const rows = usageRows(segments, sessionID, Date.now())
+        if (rows.length === 0) return emptyView()
+        const viewport = (context as { renderer?: { width?: number } }).renderer?.width
+        const window = typeof viewport === "number" && viewport > 0 ? viewport : undefined
+        const lines: Run[][] = []
+        if (stack === "column") {
+          for (const runs of rows) {
+            // A sidebar column is cut to its width with the padding kept in
+            // reserve, so configured padding cannot push it past the edge.
             const room =
-              granted !== undefined ? Math.max(1, granted - padding.left - padding.right) : undefined
-            if (room !== undefined) lines.push(...wrapRows(rows, room, config.usageSeparator))
-            else lines.push(joinRows(rows))
+              window !== undefined
+                ? Math.max(1, columnWidth(window) - padding.left - padding.right)
+                : undefined
+            lines.push(room !== undefined ? cutRuns(runs, room) : runs)
           }
-          return {
-            basis: joinedWidth(rows, config.usageSeparator),
-            lines: lines
-              .filter((runs) => runs.length > 0)
-              .map((runs) => {
-                const at = runs.findIndex((run) => run.onClick)
-                if (at < 0) return { before: runs, after: [] }
-                return { before: runs.slice(0, at), clickable: runs[at], after: runs.slice(at + 1) }
-              }),
-          }
-        } catch (error) {
-          if (!warned) {
-            warned = true
-            console.warn("opencode-status-line: render failed", error)
-          }
-          return { lines: [], basis: 0 }
+        } else {
+          // A row fits itself to the width its box was actually dealt.
+          // `renderer.width` is the window and would overstate a footer row
+          // shared with the host's own content, so prefer the box's own
+          // laid-out width, measured after the first paint; the renderer
+          // covers the paint before that measurement exists.
+          const measured = fitted()
+          const granted = measured !== undefined && measured > 0 ? measured : window
+          const room =
+            granted !== undefined ? Math.max(1, granted - padding.left - padding.right) : undefined
+          if (room !== undefined) lines.push(...wrapRows(rows, room, config.usageSeparator))
+          else lines.push(joinRows(rows))
         }
+        const drawn = {
+          basis: joinedWidth(rows, config.usageSeparator),
+          lines: lines
+            .filter((runs) => runs.length > 0)
+            .map((runs) => {
+              const at = runs.findIndex((run) => run.onClick)
+              if (at < 0) return { before: runs, after: [] }
+              return { before: runs.slice(0, at), clickable: runs[at], after: runs.slice(at + 1) }
+            }),
+        }
+        held = { sessionID, lines: drawn.lines, basis: drawn.basis }
+        return drawn
+      }
+      const view = createMemo<{ lines: RowView[]; basis: number }>(() => {
+        if (dead()) return emptyView()
+        // The heartbeat's clock: held figures and the elapsed timer repaint
+        // even while nothing is streaming.
+        version()
+        // Slots such as `prompt.footer` carry no session in their input; the
+        // route knows which conversation is on screen. Without one — the home
+        // screen, a plugin page — the line stays hidden rather than describing
+        // a conversation that is not open.
+        const sessionID = input?.sessionID ?? currentSession()
+        if (!sessionID) {
+          held = undefined
+          return emptyView()
+        }
+        // A build that throws holds the last figures instead of blanking the
+        // line; the next paint tries again.
+        return valueGuard.attempt(() => buildView(sessionID), () => heldView(sessionID))
       })
+      /** The runs as one piece of text: what a row still says without colour. */
+      const rowText = (runs: Run[]): string => runs.map((run) => run.text).join("")
       // A `span` takes its colour through `style`, not a bare `fg` prop:
       // @opentui/solid drops `fg` on spans, which paints the whole line in
       // the default foreground. Text renderables below still take `fg`.
-      const spans = (runs: Run[]) =>
-        runs.map((run) => (
-          <span style={{ fg: toneColor(run.tone, run.dim ?? false, run.host ?? false) }}>{run.text}</span>
-        ))
+      //
+      // Spans are also the first thing to give way: building one runs the
+      // colourizer, and a line without colour is still a line.
+      const spans = (runs: Run[]): JSX.Element =>
+        inkGuard.attempt<JSX.Element>(
+          () =>
+            runs.map((run) => (
+              <span style={{ fg: toneColor(run.tone, run.dim ?? false, run.host ?? false) }}>{run.text}</span>
+            )),
+          () => rowText(runs),
+        )
       const [hovered, setHovered] = createSignal(false)
-      return (
-        <Show when={view().lines.length > 0}>
+      const textLine = (runs: Run[]) => <text wrapMode="none">{spans(runs)}</text>
+      /** The clickable run: a mouse handler needs a renderable of its own. */
+      const clickLine = (run: Run) => (
+        <text
+          wrapMode="none"
+          onMouseOver={() => setHovered(true)}
+          onMouseOut={() => setHovered(false)}
+          onMouseUp={() => run.onClick?.()}
+          fg={
+            hovered()
+              ? toneColor(undefined, false, run.host ?? false)
+              : toneColor(run.tone, run.dim ?? false, run.host ?? false)
+          }
+        >
+          {spans([run])}
+        </text>
+      )
+      /**
+       * One row drawn the good way. Its parts are built here rather than left
+       * to the host's lazy children getters, so that a renderable which cannot
+       * be created at all throws inside `rowTree`'s guard instead of somewhere
+       * this plugin never sees.
+       *
+       * A row is always its own flex row, so a clickable run sharing it stays
+       * on the same line when the outer box is a column.
+       */
+      const richRow = (row: RowView) => {
+        const parts: JSX.Element[] = []
+        if (row.before.length > 0) parts.push(textLine(row.before))
+        if (row.clickable) parts.push(clickLine(row.clickable))
+        if (row.after.length > 0) parts.push(textLine(row.after))
+        return <box flexDirection="row">{parts}</box>
+      }
+      /**
+       * The same row in one piece of plain text — no spans, no colour, no click.
+       * The text is what the line is for; the rest is decoration, and a row that
+       * cannot be decorated is still worth drawing.
+       */
+      const plainRow = (row: RowView) => (
+        <box flexDirection="row">
+          <text wrapMode="none">
+            {rowText(row.before) + (row.clickable ? rowText([row.clickable]) : "") + rowText(row.after)}
+          </text>
+        </box>
+      )
+      /** A row: the good drawing, else the plain one, else nothing at all. */
+      const rowTree = (row: RowView) =>
+        rowGuard.attempt(
+          () => richRow(row),
+          () => rowGuard.lastResort(() => plainRow(row)),
+        )
+      if (dead()) return null
+      /**
+       * The box around the rows is the last thing that can fail. When even it
+       * cannot be built there is nothing to draw with, and the guard latches so
+       * that the retry loop stops: every further attempt would abandon a little
+       * more of the host's native handle pool (see guard.ts). `Line` is a
+       * component so that the box — not just the `Show` above it — is built
+       * inside the guard.
+       */
+      const Line = () =>
+        boxGuard.lastResort(() => (
           <box
             flexDirection="column"
             minWidth={0}
@@ -800,38 +950,12 @@ export default Plugin.define({
               queueMicrotask(() => setFitted(width))
             }}
           >
-            <For each={view().lines}>
-              {(row) => (
-                // A row is always its own flex row, so a clickable run sharing
-                // it stays on the same line when the outer box is a column.
-                <box flexDirection="row">
-                  <Show when={row.before.length > 0}>
-                    <text wrapMode="none">{spans(row.before)}</text>
-                  </Show>
-                  <Show when={row.clickable}>
-                    {(run) => (
-                      <text
-                        wrapMode="none"
-                        onMouseOver={() => setHovered(true)}
-                        onMouseOut={() => setHovered(false)}
-                        onMouseUp={() => run()?.onClick?.()}
-                        fg={
-                          hovered()
-                            ? toneColor(undefined, false, run().host ?? false)
-                            : toneColor(run().tone, run().dim ?? false, run().host ?? false)
-                        }
-                      >
-                        {spans([run()])}
-                      </text>
-                    )}
-                  </Show>
-                  <Show when={row.after.length > 0}>
-                    <text wrapMode="none">{spans(row.after)}</text>
-                  </Show>
-                </box>
-              )}
-            </For>
+            <For each={view().lines}>{(row) => rowTree(row)}</For>
           </box>
+        ))
+      return (
+        <Show when={view().lines.length > 0}>
+          <Line />
         </Show>
       )
     }

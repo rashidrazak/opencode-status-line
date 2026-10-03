@@ -3,6 +3,7 @@ import {
   columnWidth,
   contextBar,
   cutRuns,
+  dimRuns,
   gauge,
   gaugeFor,
   hostRuns,
@@ -129,6 +130,21 @@ describe("hostRuns", () => {
     expect(marked[0]).toMatchObject({ text: "aa", tone: "success", dim: true })
     expect(marked[1]!.onClick).toBe(runs[1]!.onClick)
     expect(runs.every((run) => run.host === undefined)).toBe(true)
+  })
+})
+
+describe("dimRuns", () => {
+  test("draws every run in its muted shade, copying rather than mutating", () => {
+    const runs: Run[] = [
+      { text: "aa", tone: "success" },
+      { text: "bb", host: true, onClick: () => {} },
+    ]
+    const held = dimRuns(runs)
+    expect(held.every((run) => run.dim === true)).toBe(true)
+    expect(held[0]).toMatchObject({ text: "aa", tone: "success" })
+    expect(held[1]!.host).toBe(true)
+    expect(held[1]!.onClick).toBe(runs[1]!.onClick)
+    expect(runs.every((run) => run.dim === undefined)).toBe(true)
   })
 })
 
