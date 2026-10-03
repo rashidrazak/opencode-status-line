@@ -18,6 +18,16 @@ and this project adheres to
   it will load again. The commands (`/opencode-status-line`, `/tps`) and the
   stats command's own ID are unchanged.
 
+### Fixed
+
+- **The live speed reading (`↯`) now tells the truth on slow and stalled
+  streams.** It is estimated over the span the retained stream deltas actually
+  cover, so output arriving a second or two apart reads its real pace instead of
+  up to twice as fast, streams slower than the window show no live reading
+  rather than a floor near 1.25 tok/s, and the dimmed figure left behind when
+  output stops keeps the last value the line actually showed instead of jumping
+  back to the burst peak. Fast streams read as before.
+
 ## [1.1.0] - 2026-10-03
 
 ### Changed

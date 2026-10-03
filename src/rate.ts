@@ -109,8 +109,6 @@ export interface TurnSample {
 export interface Meter {
   /** Bucketed streamed characters, oldest first. */
   samples: Sample[]
-  /** Start of the current run of activity; a pause longer than the window ends it. */
-  streakStart: number
   /** Arrival of the newest delta, so a stalled stream goes quiet. */
   lastDeltaAt: number
   /** The step currently streaming, once `session.step.started` was seen. */
@@ -121,7 +119,11 @@ export interface Meter {
   charsPerToken: number
   /** Last settled figure, shown until something newer replaces it. */
   final?: Final
-  /** Last live sliding reading, held after the stream stops; a restore without one rests it at zero. */
+  /**
+   * The last live sliding reading, remembered by `liveRate` as it is produced,
+   * so the dimmed figure held after the stream stops is the last one shown —
+   * never a stale snapshot of a burst. A restore without one rests it at zero.
+   */
   sliding?: { tps: number; at: number }
   /**
    * The session's high-water mark: the gauge's upper bound. It only ever rises,
@@ -135,7 +137,6 @@ export interface Meter {
 export function createMeter(opts: RateOptions = DEFAULT_RATE): Meter {
   return {
     samples: [],
-    streakStart: 0,
     lastDeltaAt: 0,
     turn: { tokens: 0, ms: 0 },
     charsPerToken: opts.charsPerToken,
@@ -153,9 +154,6 @@ export function observe(
 ): void {
   if (chars <= 0) return
   const at = Math.floor(now / opts.bucketMs) * opts.bucketMs
-  // A delta after silence starts a new streak: its rate must be measured over
-  // what has streamed since, never over the session's whole history.
-  if (meter.lastDeltaAt === 0 || now - meter.lastDeltaAt > opts.windowMs) meter.streakStart = at
   const last = meter.samples[meter.samples.length - 1]
   if (last && last.at === at) last.chars += chars
   else meter.samples.push({ at, chars })
@@ -166,13 +164,11 @@ export function observe(
   }
   meter.lastDeltaAt = now
   prune(meter, now, opts)
-  // Snapshot the live reading while it is fresh: this is what the sliding
-  // figure shows once the stream stops, so the number survives the finish line.
+  // `liveRate` keeps the reading for the held figure; calling it here also
+  // feeds the session's high-water mark the moment a delta lands, before the
+  // next repaint.
   const tps = liveRate(meter, now, opts)
-  if (tps !== undefined) {
-    meter.sliding = { tps, at: now }
-    notePeak(meter, tps)
-  }
+  if (tps !== undefined) notePeak(meter, tps)
 }
 
 /**
@@ -184,26 +180,48 @@ export function notePeak(meter: Meter, tps: number): void {
 }
 
 function prune(meter: Meter, now: number, opts: RateOptions): void {
+  // The left edge is open: a bucket exactly one window old has aged out, so a
+  // reading works from the deltas the covered span actually holds.
   const cutoff = now - opts.windowMs
-  while (meter.samples.length > 0 && meter.samples[0]!.at < cutoff) meter.samples.shift()
+  while (meter.samples.length > 0 && meter.samples[0]!.at <= cutoff) meter.samples.shift()
 }
 
 /**
- * The sliding estimate: streamed characters over the window, divided by the
- * calibrated ratio. Undefined once the stream has been quiet for a window.
+ * The sliding estimate: streamed characters over the span the retained deltas
+ * actually cover, divided by the calibrated ratio, and read as whichever of
+ * two views is lower:
+ *
+ * - inter-arrival — what streamed after the oldest retained delta over the span
+ *   between the retained deltas themselves. The oldest sample's characters are
+ *   left out so a regular stream reads its true cadence; one retained delta is
+ *   no speed at all, rather than a lone token scored against the span floor.
+ * - density — every retained character over the age of the window, so a stream
+ *   that has stopped decays with time instead of freezing at its last rate.
+ *
+ * Undefined once the stream has been quiet for a window, or while the figure is
+ * below `minTps` (silence, by the knob's own meaning). A figure at or above the
+ * floor is remembered on the meter, so the held reading is the last value the
+ * line showed live — never a stale delta snapshot.
  */
 export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): number | undefined {
   prune(meter, now, opts)
   if (now - meter.lastDeltaAt > opts.windowMs) return undefined
-  if (meter.samples.length === 0) return undefined
-  let chars = 0
-  for (const sample of meter.samples) chars += sample.chars
-  // While the streak is younger than the window, measure it over its own age
-  // (with a floor, so the first figures do not swing); once it is older, the
-  // samples cover exactly one window and the rate is chars per window.
-  const span = Math.min(Math.max(now - meter.streakStart, opts.minSpanMs), opts.windowMs)
-  const tps = chars / meter.charsPerToken / (span / 1000)
-  return tps >= opts.minTps ? tps : undefined
+  if (meter.samples.length < 2) return undefined
+  const oldest = meter.samples[0]!
+  const newest = meter.samples[meter.samples.length - 1]!
+  let total = 0
+  for (const sample of meter.samples) total += sample.chars
+  const afterOldest = total - oldest.chars
+  // The span floor damps the first instants of a stream, and the window caps
+  // both spans so no estimate leans on output older than it looks back over.
+  const interSpan = Math.min(Math.max(newest.at - oldest.at, opts.minSpanMs), opts.windowMs)
+  const densitySpan = Math.min(Math.max(now - oldest.at, opts.minSpanMs), opts.windowMs)
+  const inter = afterOldest / meter.charsPerToken / (interSpan / 1000)
+  const density = total / meter.charsPerToken / (densitySpan / 1000)
+  const tps = Math.min(inter, density)
+  if (tps < opts.minTps) return undefined
+  meter.sliding = { tps, at: now }
+  return tps
 }
 
 /**
@@ -489,7 +507,7 @@ export const USAGE_LABELS: Record<LabelStyle, UsageLabels> = {
  * The two families have a life of their own rather than appearing and
  * vanishing with the stream:
  *
- *   sliding     live while the window has deltas, then the last reading held
+ *   sliding     live while the retained deltas give a rate, then the last reading held
  *   cumulative  live while a step is in flight, then the settled turn average
  *
  * A held or settled figure wears `live: false` and is drawn dimmed, so history
