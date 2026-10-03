@@ -15,16 +15,17 @@ problems go through [SECURITY.md](SECURITY.md), never a public issue.
 ## Working on the plugin
 
 Bun is the only requirement. The tests import only local modules, so they need
-no install and no build; the typechecker is the one command that wants the
-development dependencies pinned by `bun.lock`:
+no install; the typechecker, the tarball check and the build of the npm entry
+want the development dependencies pinned by `bun.lock`:
 
 ```sh
 git clone https://github.com/rashidrazak/opencode-status-line.git
 cd opencode-status-line
 bun test                    # the whole suite — no install needed
 bun test test/rate.test.ts  # one module — no install needed
-bun install                 # once, for the typechecker
+bun install                 # once, for the typechecker and the build
 bun run typecheck           # src/, the tests and the entry
+bun run build:entry         # dist/tui.js — the entry npm consumers run
 npm run check:pack          # the tarball consumers install
 ```
 
@@ -57,10 +58,11 @@ the TSX on load and reloads the plugin when a file it imports is saved:
 - User-visible changes get a bullet under `## [Unreleased]` in `CHANGELOG.md`;
   each release's section becomes its GitHub Release body.
 - `npm run check:pack` must stay green: every module the entry imports has to
-  be packed, and the package must not grow a build step or a lockfile. Keep
-  `/** @jsxImportSource @opentui/solid */` first in `src/tui.tsx`: npm
-  consumers transpile the entry at runtime, where the packed `tsconfig.json`
-  is never read.
+  be packed, and the packed entry has to be the precompiled `dist/tui.js` that
+  `bun run build:entry` writes. Keep `/** @jsxImportSource @opentui/solid */`
+  first in `src/tui.tsx`: a loader without OpenCode's Solid transform compiles
+  the JSX against React without it, and the packed `tsconfig.json` is never
+  read.
 
 ### Code and comments
 

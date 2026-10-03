@@ -110,8 +110,12 @@ The plugin is CLI-only, so it goes in `~/.config/opencode/cli.json`, not
 }
 ```
 
+OpenCode downloads the published package and runs its prebuilt entry; there is
+nothing to compile on your side.
+
 From a checkout, point at the folder instead — an absolute path or a path
-relative to the config folder both work:
+relative to the config folder both work. OpenCode then transpiles the source
+itself, so a saved edit reloads the plugin in place:
 
 ```json
 {
@@ -807,3 +811,32 @@ returns to one row.
 Versions before 1.0.2 compiled the entry against the React runtime when
 installed from npm, and React is not a dependency. Update the plugin to 1.0.2
 or newer — if `cli.json` pins a version, bump it — and restart OpenCode.
+
+**The line lost its colours.**
+A step of the drawing threw — usually a host theme the plugin could not read —
+so the runs fall back to the terminal's default ink. Every reading is still
+there, and your `colors` settings come back with the next paint that works.
+
+**One reading is missing and the rest of the line is fine.**
+A segment that throws is skipped rather than taking the line with it. Only the
+segment whose data could not be read disappears.
+
+**The numbers are dim and stopped moving.**
+The line could not build a fresh row, so it holds the figures it drew last —
+dimmed, to say they are not from this paint — and tries again on the next one.
+The log carries a single warning naming what failed.
+
+**The whole line is a single `⚠`.**
+Every segment failed, which means a host API the line depends on is gone rather
+than merely quiet. OpenCode's log has the warning that names it.
+
+**The line disappeared and the log says it failed three times in a row.**
+OpenTUI gives every native object — a text buffer, a span, a syntax style — a
+slot in one shared table, and an attempt that fails after allocating abandons
+its slots. A host that cannot draw the line at all would exhaust that table and
+take the whole TUI down with it, so the plugin stops drawing instead, warns
+once, and stays quiet until it is reloaded. Restart OpenCode. If the line
+returns and then disappears again, please
+[open an issue](https://github.com/rashidrazak/opencode-status-line/issues):
+it means the plugin and the host are not sharing a TUI runtime, and that is
+worth fixing rather than living with.
