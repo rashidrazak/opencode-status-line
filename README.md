@@ -149,8 +149,8 @@ The package ships source plus one built file. A checkout install runs
 `src/tui.tsx` as TSX, which OpenCode transpiles itself; npm consumers run
 `dist/tui.js`, which `bun run build:entry` compiles with OpenTUI's own Solid
 plugin so the entry imports `@opentui/solid` by name instead of resolving a JSX
-runtime at load (see [AGENTS.md][agents] — that difference is the 1.0.3 crash
-fix). `package.json` maps `./tui` to `dist/tui.js`, and the `files` allowlist
+runtime at load — see [AGENTS.md][agents] for why the entry is built.
+`package.json` maps `./tui` to `dist/tui.js`, and the `files` allowlist
 carries both `src/` and `dist/`. `@opencode/plugin` is a dependency; the
 rendering peers (`@opentui/core`, `@opentui/solid`, `solid-js`) are provided by
 OpenCode. `npm run check:pack` verifies that every module the entry imports is

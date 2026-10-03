@@ -179,9 +179,9 @@ just our package and whose lockfile answers *why* something landed:
   the build before checking the tarball, and `dist/` is gitignored so there is
   no committed artifact to go stale. The directory path is untouched: the root
   shim still re-exports the TSX, which the host transforms itself.
-- Reproduce an install story in the host, never in a bundler: `.handle-probe/`
-  has the probe and its recipe, `stage=load` failures land in the host log, and
-  `bun build` proves nothing about either path.
+- Reproduce an install story in the host, never in a bundler: `stage=load`
+  failures land in the host log, and `bun build` proves nothing about either
+  path.
 - `console.warn` from a plugin does **not** reach the host log (measured: the
   log holds only ERROR/WARN/INFO lines from the host itself), so the guards'
   warnings are for a developer watching the terminal — the user-visible signals
