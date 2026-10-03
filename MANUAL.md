@@ -300,7 +300,7 @@ corrects the estimate against the exact counts as they arrive.
 | Figure | Label | What it means |
 | --- | --- | --- |
 | Sliding | `↯` | Speed over the last few seconds — what is happening right now |
-| Cumulative | `μ` or `avg` | Average across this turn so far: exact tokens from finished steps plus the step in flight |
+| Cumulative | `μ` or `avg` | Average across this turn so far: exact tokens from finished steps plus the step in flight, over the time spent producing tokens |
 | Settled | `μ` / `avg` / `✓` | The final figure from a finished step or turn, kept on screen |
 
 ### Which readings you see
@@ -316,13 +316,15 @@ corrects the estimate against the exact counts as they arrive.
 - `[]` — no live readings; show only the settled figure (the segment can be
   empty until something finishes)
 
-### The sliding window
+### The speed window
 
-These keys control the `↯` reading:
+These keys tune the live speed readings — the sliding figure (`↯`) and the
+turn average's decode clock (`μ`):
 
 | Key | Default | Allowed | What it does |
 | --- | --- | --- | --- |
 | `window.ms` | `3000` | 1–600000 | How far back the window looks, in milliseconds. Bigger = smoother, slower to react |
+| `window.maxGapMs` | `3000` | 0–600000 | Longest pause between deltas that counts toward the turn average, in milliseconds. `0` counts pauses in full |
 | `window.minSpanMs` | `800` | 0–600000 | Ignore spans shorter than this, so the first moment of a stream does not swing wildly |
 | `window.minTps` | `0.5` | 0–10000 | Speeds below this count as silence and hide the reading |
 | `window.bucketMs` | `100` | 1–10000 | Group incoming characters into buckets of this size before measuring |
@@ -333,6 +335,13 @@ These keys control the `↯` reading:
   "window": { "ms": 5000, "hold": false }
 }
 ```
+
+The turn average (`μ`) measures token-producing time only: each gap between
+streamed deltas counts when the later delta arrives, and nothing after the
+newest delta does, so the figure holds still through a shell command, tool run,
+permission prompt or question wait and resumes when tokens do. A single pause
+longer than `window.maxGapMs` counts only up to that ceiling, so a provider
+stall cannot crater the figure; set it to `0` to count pauses in full.
 
 ### The gauge
 
@@ -582,6 +591,7 @@ Every key, its default, and the values it accepts. All keys are optional.
 | --- | --- | --- |
 | `readings` | `["sliding", "cumulative"]` | `"sliding"`, `"cumulative"`, or both; `[]` for settled figures only |
 | `window.ms` | `3000` | number 1–600000 |
+| `window.maxGapMs` | `3000` | number 0–600000 (0 = uncapped) |
 | `window.minSpanMs` | `800` | number 0–600000 |
 | `window.minTps` | `0.5` | number 0–10000 |
 | `window.bucketMs` | `100` | number 1–10000 |

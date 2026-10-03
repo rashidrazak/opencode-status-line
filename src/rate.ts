@@ -17,6 +17,12 @@ export type LiveReading = "sliding" | "cumulative"
 export interface RateOptions {
   /** How much streamed output the sliding estimate looks back over. */
   windowMs: number
+  /**
+   * Ceiling on one inter-delta gap charged to the live turn average's decode
+   * clock, in milliseconds: a provider stall contributes at most this much
+   * when deltas resume. `0` counts gaps in full.
+   */
+  maxGapMs: number
   /** Shortest span trusted for a live figure, so the first second does not swing wildly. */
   minSpanMs: number
   /** Below this the meter is noise — a stray delta, or a model that has all but stalled. */
@@ -44,6 +50,7 @@ export interface RateOptions {
 
 export const DEFAULT_RATE: RateOptions = {
   windowMs: 3_000,
+  maxGapMs: 3_000,
   minSpanMs: 800,
   minTps: 0.5,
   bucketMs: 100,
@@ -86,6 +93,15 @@ export interface Step {
   tokenAt?: number
   /** First token-bearing chunk on the local clock, for the fallback span. */
   tokenArrivedAt?: number
+  /**
+   * Decode time of this step, in milliseconds: the sum of the observed
+   * inter-delta gaps, each capped at `maxGapMs`. The live average's
+   * denominator advances only here, so a pause in output holds the figure
+   * instead of decaying.
+   */
+  decodeMs?: number
+  /** Local arrival of the newest observed delta; the next gap is measured from here. */
+  lastDeltaAt?: number
 }
 
 /** Exact decode totals of the turn in flight: finished steps only. */
@@ -158,6 +174,14 @@ export function observe(
   if (last && last.at === at) last.chars += chars
   else meter.samples.push({ at, chars })
   if (meter.step) {
+    // The decode clock: every observed gap advances the step's decode time,
+    // the first delta starting it at zero. Time since the newest delta is
+    // deliberately not charged, and a gap is capped at `maxGapMs`, so the live
+    // average holds through pauses and a provider stall cannot crater it.
+    const gap = meter.step.lastDeltaAt === undefined ? 0 : Math.max(0, now - meter.step.lastDeltaAt)
+    const counted = opts.maxGapMs > 0 ? Math.min(gap, opts.maxGapMs) : gap
+    meter.step.decodeMs = (meter.step.decodeMs ?? 0) + counted
+    meter.step.lastDeltaAt = now
     meter.step.chars += chars
     meter.step.tokenAt ??= eventNow ?? now
     meter.step.tokenArrivedAt ??= now
@@ -229,16 +253,21 @@ export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_
  * the characters of the step in flight, over the decode time they took. With
  * turn folding off it describes the current step alone. Live only — it needs a
  * step that has emitted its first token.
+ *
+ * The denominator is the step's decode clock, not wall-clock time: each gap
+ * between observed deltas counts up to `maxGapMs` when the later delta lands,
+ * and nothing after the newest delta does. The figure therefore holds still
+ * while output is paused — a shell command, any tool, a permission or question
+ * wait — and resumes with the next delta. `now` is accepted as the caller's
+ * clock but deliberately does not advance the span.
  */
 export function cumulativeRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): number | undefined {
   const step = meter.step
   if (!step) return undefined
   // Steps that stream tool arguments expose no deltas on the bus, so their
-  // first-token marker never lands. Fall back to the step's arrival: the
-  // average stays on screen through the whole turn instead of vanishing.
-  const startedAt = step.tokenArrivedAt ?? step.arrivedAt
+  // first-token marker never lands — and their decode clock stays at zero.
   const tokens = meter.turn.tokens + step.chars / meter.charsPerToken
-  const ms = meter.turn.ms + Math.max(0, now - startedAt)
+  const ms = meter.turn.ms + (step.decodeMs ?? 0)
   if (ms < opts.minSpanMs || tokens <= 0) return undefined
   const tps = tokens / (ms / 1000)
   return tps >= opts.minTps ? tps : undefined

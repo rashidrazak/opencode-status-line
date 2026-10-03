@@ -181,8 +181,9 @@ describe("cumulative rate", () => {
     const meter = createMeter(opts)
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0 + 1_000, 2_000, 200, opts) // first token T0+1100, 400 chars
-    // 400 chars ÷ 4 = 100 tokens over the 2 s since the first token.
-    expect(cumulativeRate(meter, T0 + 3_100, opts)).toBeCloseTo(50, 1)
+    // 400 chars ÷ 4 = 100 tokens over the 1.9 s the deltas span: the decode
+    // clock charges only time between observed deltas.
+    expect(cumulativeRate(meter, T0 + 3_100, opts)).toBeCloseTo(52.6, 1)
   })
 
   test("folds the turn's exact steps when folding is on", () => {
@@ -193,24 +194,83 @@ describe("cumulative rate", () => {
     endStep(meter, "a", 160, T0 + 3_100, T0 + 3_100) // 2 s decode → ratio 2.5 → 3.55
     beginStep(meter, "b", T0 + 3_200, T0 + 3_200)
     stream(meter, T0 + 3_300, 1_000, 200) // 200 chars, first token T0+3400
-    // (160 exact + 200/3.55 estimated) / (2000 ms + 1000 ms) ≈ 72.1
-    expect(Math.abs(cumulativeRate(meter, T0 + 4_400)! - 72.1)).toBeLessThan(1)
+    // (160 exact + 200/3.55 estimated) / (2000 ms exact + the 900 ms
+    // between b's deltas) ≈ 74.6
+    expect(Math.abs(cumulativeRate(meter, T0 + 4_400)! - 74.6)).toBeLessThan(1)
   })
 
-  test("stays live through a step whose deltas are not observable", () => {
+  test("holds the turn average through a step whose deltas are not observable", () => {
     const meter = createMeter()
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
     endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 1 s
     beginStep(meter, "b", T0 + 2_200, T0 + 2_200) // tool step: no deltas arrive
-    // One second into the silent step, the turn's average so far — not nothing.
-    expect(cumulativeRate(meter, T0 + 3_200, OPTS)).toBeCloseTo(50, 5)
+    // The silent step adds no decode time, so the turn's 100 tok/s holds
+    // instead of decaying as the tool's clock runs.
+    expect(cumulativeRate(meter, T0 + 3_200, OPTS)).toBeCloseTo(100, 5)
   })
 
   test("stays silent without a step in flight", () => {
     const meter = createMeter()
     expect(cumulativeRate(meter, T0)).toBeUndefined()
+  })
+})
+
+describe("decode clock", () => {
+  test("holds the live average through a long silence", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "msg", T0, T0)
+    const stop = stream(meter, T0, 2_000, 400)
+    const held = cumulativeRate(meter, stop)!
+    // 800 chars ÷ 4 = 200 tokens over the 1.9 s between the deltas.
+    expect(held).toBeCloseTo(105.3, 1)
+    // A silence far longer than maxGapMs, repainted at the ticker's cadence:
+    // the figure stays exactly where the last delta left it, and stays live.
+    for (let now = stop; now <= stop + 30_000; now += 250) {
+      expect(cumulativeRate(meter, now)).toBe(held)
+      expect(display(meter, now, ["cumulative"])?.readings[0]?.live).toBe(true)
+    }
+  })
+
+  test("a pause longer than maxGapMs adds at most the ceiling", () => {
+    const meter = createMeter() // maxGapMs: 3000
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0, 400) // first delta starts the clock
+    observe(meter, T0 + 1_000, 400)
+    expect(cumulativeRate(meter, T0 + 1_000)).toBeCloseTo(200, 5)
+    observe(meter, T0 + 31_000, 400) // a 30 s stall counts only the ceiling
+    // 300 estimated tokens over 1000 ms + the 3000 ms ceiling.
+    expect(cumulativeRate(meter, T0 + 31_000)).toBeCloseTo(75, 5)
+  })
+
+  test("maxGapMs 0 counts the full inter-delta gap", () => {
+    const opts: RateOptions = { ...DEFAULT_RATE, maxGapMs: 0 }
+    const meter = createMeter(opts)
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0, 400, undefined, opts)
+    observe(meter, T0 + 1_000, 400, undefined, opts)
+    observe(meter, T0 + 31_000, 400, undefined, opts)
+    // 300 estimated tokens over the full 31 s of observed gaps.
+    expect(cumulativeRate(meter, T0 + 31_000, opts)).toBeCloseTo(300 / 31, 5)
+  })
+
+  test("genuinely slow arrival still reads slow", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0, 4)
+    observe(meter, T0 + 2_000, 4)
+    observe(meter, T0 + 4_000, 4)
+    // Three estimated tokens over the four seconds between their arrivals.
+    expect(cumulativeRate(meter, T0 + 4_000)).toBeCloseTo(0.75, 5)
+  })
+
+  test("a lone delta is not yet a speed", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0, 400)
+    expect(cumulativeRate(meter, T0 + 5_000)).toBeUndefined()
   })
 })
 

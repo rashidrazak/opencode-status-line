@@ -33,6 +33,12 @@ and this project adheres to
   rather than a floor near 1.25 tok/s, and the dimmed figure left behind when
   output stops keeps the last value the line actually showed instead of jumping
   back to the burst peak. Fast streams read as before.
+- **The turn average (`μ`) now counts token-producing time only.** Each gap
+  between streamed deltas advances its decode clock, and a pause longer than
+  `window.maxGapMs` (default `3000` ms; `0` counts pauses in full) counts only
+  up to that ceiling. A shell command, tool run, permission prompt or question
+  wait no longer drags the live average down while it runs, and slow-but-steady
+  output still reads slow.
 
 ## [1.1.0] - 2026-10-03
 
