@@ -58,8 +58,8 @@ import {
   tpsStats,
   USAGE_LABELS,
 } from "./rate.ts"
-import { columnWidth, contextBar, cutRuns, dimRuns, gaugeFor, hostRuns, joinedWidth, wrapRows, type CapInput, type Run, type RunTone } from "./render.ts"
-import { cacheShare, compact, contextUsed, duration, money, pressureTone, shellsLabel, type TokenRecord } from "./format.ts"
+import { cacheRuns, columnWidth, contextRuns, cutRuns, dimRuns, gaugeFor, hostRuns, joinedWidth, muted, wrapRows, type CapInput, type Run, type RunTone } from "./render.ts"
+import { contextUsed, duration, money, shellsLabel, type TokenRecord } from "./format.ts"
 
 /** How often the line redraws while something is on screen. */
 const TICK_MS = 250
@@ -435,33 +435,6 @@ export default Plugin.define({
       return undefined
     }
 
-    const muted = (text: string): Run => ({ text, tone: "muted" })
-
-    const contextRuns = (tokens: TokenRecord | undefined, limit: number | undefined): Run[] => {
-      const used = contextUsed(tokens)
-      if (used <= 0) return []
-      if (limit === undefined) return [muted(compact(used))]
-      const ratio = Math.min(1, used / limit)
-      const tone = pressureTone(ratio, config.contextWarn / 100, config.contextDanger / 100)
-      return [
-        ...contextBar(ratio, contextWidth, tone),
-        { text: ` ${Math.round(ratio * 100)}%`, tone },
-        muted(" — "),
-        muted(compact(used)),
-      ]
-    }
-
-    const cacheRuns = (tokens: TokenRecord | undefined): Run[] => {
-      const share = cacheShare(tokens)
-      if (share === undefined) return []
-      return [
-        muted(`${labels.cache} `),
-        muted(`${(share * 100).toFixed(1)}%`),
-        muted(" — "),
-        muted(compact(tokens?.cache?.read ?? 0)),
-      ]
-    }
-
     /** The location a session's shells and working tree live at; the session record knows best. */
     const sessionLocation = (sessionID: string): SessionLocation =>
       sessionUsage(sessionID)?.location ?? context.location ?? context.data.location.default()
@@ -577,8 +550,16 @@ export default Plugin.define({
       /** One segment's runs, before the exclusion mark. */
       const partFor = (segment: UsageSegment): Run[] => {
         if (segment === "shells") return shellRuns(sessionID)
-        if (segment === "context") return contextRuns(window.tokens, limit)
-        if (segment === "cache") return cacheRuns(window.tokens)
+        if (segment === "context") {
+          return contextRuns({
+            tokens: window.tokens,
+            limit,
+            width: contextWidth,
+            warnAt: config.contextWarn,
+            dangerAt: config.contextDanger,
+          })
+        }
+        if (segment === "cache") return cacheRuns(window.tokens, labels.cache)
         if (segment === "meter") {
           const found = meters.get(sessionID)
           // A session with no meter has met this generation mid-history — a

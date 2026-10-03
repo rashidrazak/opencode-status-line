@@ -46,7 +46,9 @@ Reading it from left to right:
 A few useful details:
 
 - A piece with nothing to say hides itself, separator and all. A clean git
-  tree draws no `+/-` counter, a fresh session draws no cost, and so on.
+  tree draws no `+/-` counter, a fresh session draws no cost, and so on. The
+  context and cache segments are the exception: from the first paint they draw
+  zero figures, so the line keeps its shape until the first reading arrives.
 - The shells count is clickable: click it to toggle OpenCode's composer, whose
   Shell tab lists the running commands and opens their output.
 - Old figures stay on screen in a lighter shade. That is how you tell "happening
@@ -141,8 +143,8 @@ The names you can use:
 | Name | Draws | Hides itself when |
 | --- | --- | --- |
 | `shells` | `2 shells` | No shell commands are running |
-| `context` | Context bar, `%`, token count | Nothing is in the context window yet |
-| `cache` | `⧉ 99.8% — 571.8k` | Nothing has been read yet |
+| `context` | Context bar, `%`, token count | Never — starts at an empty bar, `0%`, `0` (or a plain `0` when the window is unknown) |
+| `cache` | `⧉ 99.8% — 571.8k` | Never — starts at `0.0% — 0` |
 | `meter` | Gauge and speed readings | No speed figure exists yet |
 | `cost` | `$0.75` | The session has cost nothing |
 | `time` | `2h07m` | The session start time is unknown |
@@ -488,6 +490,12 @@ The context bar shows how much of the model's context window the newest request
 used. It shares the gauge's drawing, so the two bars always match in width and
 style unless you give the context bar its own width.
 
+Until the session's first step reports usage, the bar is empty and the segment
+reads `0%` and `0` — or a plain `0` when OpenCode does not know the model's
+window — while the cache segment beside it reads `0.0% — 0`. The first reading
+replaces the zeros as it arrives, so a fresh session shows the line's full
+shape instead of looking like the segments are switched off.
+
 | Key | Default | Allowed | What it does |
 | --- | --- | --- | --- |
 | `usage.contextWidth` | `"gauge"` | `"gauge"` or 1–60 | Cells the bar draws. `"gauge"` matches `cap.gaugeWidth` |
@@ -775,7 +783,8 @@ to silence it.
 
 **A segment disappeared.**
 Segments hide themselves when they have nothing to say: no cost yet, a clean
-tree, no cache reads, no running shells. That is normal. Also check the
+tree, no running shells. That is normal — and the context and cache segments
+are not among them, drawing zeros until the first reading. Also check the
 segment is still in `usage.segments`, and — when the line is placed in several
 slots — that the placement has not given itself its own list in
 `usage.surfaces`, which replaces the shared one.

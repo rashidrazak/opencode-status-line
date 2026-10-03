@@ -17,6 +17,12 @@ and this project adheres to
   ["-local.opencode-status-line"]` — write `"-opencode-status-line"` instead, or
   it will load again. The commands (`/opencode-status-line`, `/tps`) and the
   stats command's own ID are unchanged.
+- **The context and cache segments no longer disappear before their first
+  reading.** A fresh session draws both from the first paint — the context
+  segment as an empty bar, `0%` and `0` (or a plain `0` when OpenCode does not
+  know the model's window), the cache segment as `⧉ 0.0% — 0` — and the first
+  step's usage replaces the zeros on the spot. The line keeps its full shape
+  instead of looking like those segments are switched off.
 
 ### Fixed
 
