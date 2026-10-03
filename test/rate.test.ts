@@ -14,6 +14,7 @@ import {
   observe,
   peakTps,
   recordedSteps,
+  recordStreamed,
   restoreFinal,
   speedTone,
   tpsStats,
@@ -191,12 +192,12 @@ describe("cumulative rate", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 2_000, 200) // 400 chars, first token T0+1100
-    endStep(meter, "a", 160, T0 + 3_100, T0 + 3_100) // 2 s decode → ratio 2.5 → 3.55
+    endStep(meter, "a", 160, T0 + 3_100, T0 + 3_100) // 1.9 s of observed decode gaps
     beginStep(meter, "b", T0 + 3_200, T0 + 3_200)
     stream(meter, T0 + 3_300, 1_000, 200) // 200 chars, first token T0+3400
-    // (160 exact + 200/3.55 estimated) / (2000 ms exact + the 900 ms
-    // between b's deltas) ≈ 74.6
-    expect(Math.abs(cumulativeRate(meter, T0 + 4_400)! - 74.6)).toBeLessThan(1)
+    // (160 exact + 200/3.55 estimated) / (1900 ms exact + the 900 ms
+    // between b's deltas) ≈ 77.3
+    expect(Math.abs(cumulativeRate(meter, T0 + 4_400)! - 77.3)).toBeLessThan(1)
   })
 
   test("holds the turn average through a step whose deltas are not observable", () => {
@@ -204,11 +205,11 @@ describe("cumulative rate", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 1 s
+    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
     beginStep(meter, "b", T0 + 2_200, T0 + 2_200) // tool step: no deltas arrive
-    // The silent step adds no decode time, so the turn's 100 tok/s holds
+    // The silent step adds no decode time, so the turn's ~111 tok/s holds
     // instead of decaying as the tool's clock runs.
-    expect(cumulativeRate(meter, T0 + 3_200, OPTS)).toBeCloseTo(100, 5)
+    expect(cumulativeRate(meter, T0 + 3_200, OPTS)).toBeCloseTo(111.1, 1)
   })
 
   test("stays silent without a step in flight", () => {
@@ -279,8 +280,11 @@ describe("step settlement", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0 + 1_000, 2_000, 200) // 400 chars, first token T0+1100
+    // 160 tokens over the 1.9 s of observed decode gaps; the previous delta's
+    // 100 ms tail is not charged, so the decode clock is preferred over the
+    // 2 s ended span.
     const tps = endStep(meter, "msg", 160, T0 + 3_100, T0 + 3_100)
-    expect(tps).toBeCloseTo(80, 5) // 160 tokens in 2 s, TTFT excluded
+    expect(tps).toBeCloseTo(84.2, 1)
     // 400 chars / 160 tokens = 2.5; EMA from 4 → 3.55.
     expect(meter.charsPerToken).toBeCloseTo(3.55, 5)
   })
@@ -289,7 +293,9 @@ describe("step settlement", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0 + 5_000, 1_000, 100) // 5 s before the first token, then 100 chars/s
-    expect(endStep(meter, "msg", 100, T0 + 6_100, T0 + 6_100)).toBeCloseTo(100, 5)
+    // The decode clock starts at T0+5100: 100 tokens over the 0.9 s between
+    // the deltas, not the 6.1 s since the step began.
+    expect(endStep(meter, "msg", 100, T0 + 6_100, T0 + 6_100)).toBeCloseTo(111.1, 1)
   })
 
   test("falls back to arrival times when the event clock is unusable", () => {
@@ -307,13 +313,122 @@ describe("step settlement", () => {
     expect(meter.final?.kind).toBe("turn")
   })
 
-  test("ignores nonsense durations and missing steps", () => {
+  test("folds a below-floor step's tokens with the span clamped", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "msg", T0, T0)
+    // A 10 ms span is below the floor: the duration is clamped to the floor
+    // and the exact tokens still fold, rather than the step being discarded.
+    expect(endStep(meter, "msg", 100, T0 + 10, T0 + 10)).toBeCloseTo(2_000, 5)
+    expect(meter.turn).toEqual({ tokens: 100, ms: 50 })
+    expect(meter.final?.kind).toBe("turn")
+  })
+
+  test("folds an absurd span's tokens too, with the duration clamped", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "msg", T0, T0)
+    // The ended span is beyond the ceiling and the arrival span is zero: no
+    // candidate is usable, so the event clock is clamped and the tokens fold.
+    expect(endStep(meter, "msg", 100, T0 + 7_200_000, T0)).toBeCloseTo(100 / 3_600, 5)
+    expect(meter.turn).toEqual({ tokens: 100, ms: 3_600_000 })
+  })
+
+  test("ignores a missing step or a step with no tokens", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
-    expect(endStep(meter, "msg", 100, T0 + 10, T0 + 10)).toBeUndefined() // below the floor
-    beginStep(meter, "msg", T0, T0)
-    expect(endStep(meter, "msg", 100, T0 + 7_200_000, T0)).toBeUndefined() // absurd
     expect(endStep(meter, "other", 100, T0 + 2_000, T0)).toBeUndefined() // never started
+    expect(endStep(meter, "msg", 0, T0 + 2_000, T0 + 2_000)).toBeUndefined() // no exact tokens
+    expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
+    expect(meter.final).toBeUndefined()
+  })
+})
+
+describe("settled span", () => {
+  test("uses the observed decode clock, not the tool-inclusive ended span", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    const stop = stream(meter, T0, 2_000, 200) // first token T0+100, decode clock 1.9 s
+    // A shell runs for a minute before the step settles: its runtime belongs to
+    // the tool, not to the model, so the settled figure matches the decode.
+    const tps = endStep(meter, "msg", 200, stop + 60_000, stop + 60_000)
+    expect(tps).toBeCloseTo(200 / 1.9, 5)
+    expect(meter.turn).toEqual({ tokens: 200, ms: 1_900 })
+  })
+
+  test("prefers the observed decode clock over a usable stream boundary", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    const stop = stream(meter, T0, 2_000, 200) // decode clock: 1.9 s
+    recordStreamed(meter, "msg", T0 + 4_000) // boundary span: 3.9 s
+    expect(endStep(meter, "msg", 200, stop + 60_000, stop + 60_000)).toBeCloseTo(200 / 1.9, 5)
+  })
+
+  test("a step met mid-stream does not prefer its partial decode clock", () => {
+    const meter = createMeter()
+    // A step seeded across a restart: the record knows the first token, but
+    // the deltas before this process started were never observed.
+    meter.step = {
+      assistantMessageID: "msg",
+      chars: 2_000,
+      at: T0,
+      arrivedAt: T0,
+      tokenAt: T0 + 10_000,
+      tokenArrivedAt: T0 + 10_000,
+    }
+    observe(meter, T0 + 40_000, 40) // the first two deltas this process saw
+    observe(meter, T0 + 40_100, 40)
+    recordStreamed(meter, "msg", T0 + 50_000)
+    // 400 tokens over the stream boundary's 40 s, not the 100 ms clock the
+    // later deltas alone accumulated.
+    expect(endStep(meter, "msg", 400, T0 + 90_000, T0 + 90_000)).toBeCloseTo(10, 5)
+    expect(meter.turn).toEqual({ tokens: 400, ms: 40_000 })
+  })
+
+  test("ends at the host's stream boundary without a decode clock", () => {
+    const meter = createMeter()
+    // A step met mid-stream — a reload: the first token is known from the
+    // record, but its deltas were never observed.
+    meter.step = {
+      assistantMessageID: "msg",
+      chars: 400,
+      at: T0,
+      arrivedAt: T0,
+      tokenAt: T0 + 1_000,
+      tokenArrivedAt: T0 + 1_000,
+    }
+    recordStreamed(meter, "msg", T0 + 6_000)
+    // The ended event trails a half-minute tool; the stream boundary does not.
+    expect(endStep(meter, "msg", 200, T0 + 36_000, T0 + 36_000)).toBeCloseTo(40, 5)
+    expect(meter.turn).toEqual({ tokens: 200, ms: 5_000 })
+  })
+
+  test("falls from a decode clock out of bounds to the stream boundary", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 1_000, 40) // a lone delta: the decode clock is still zero
+    recordStreamed(meter, "msg", T0 + 3_000)
+    // The ended span trails a tool by a minute; the boundary gives the 2 s
+    // decode span the observed single delta cannot.
+    expect(endStep(meter, "msg", 10, T0 + 63_000, T0 + 63_000)).toBeCloseTo(5, 5)
+  })
+
+  test("falls past an unusable stream boundary to the ended span", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    recordStreamed(meter, "msg", T0 + 10) // before the step even started: nonsense
+    expect(endStep(meter, "msg", 100, T0 + 2_000, T0 + 2_000)).toBeCloseTo(50, 5)
+  })
+
+  test("ignores a boundary for another step or with none open", () => {
+    const meter = createMeter()
+    recordStreamed(meter, "msg", T0)
+    expect(meter.step).toBeUndefined()
+    beginStep(meter, "msg", T0, T0)
+    recordStreamed(meter, "other", T0 + 5_000)
+    expect(meter.step?.streamedAt).toBeUndefined()
+    recordStreamed(meter, "msg", T0 + 5_000)
+    expect(meter.step?.streamedAt).toBe(T0 + 5_000)
   })
 })
 
@@ -323,18 +438,18 @@ describe("turn fold", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 1 s
+    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
     beginStep(meter, "b", T0 + 2_200, T0 + 2_200)
     stream(meter, T0 + 2_300, 1_000, 400)
-    endStep(meter, "b", 200, T0 + 3_400, T0 + 3_400) // 200 tokens in 1 s
+    endStep(meter, "b", 200, T0 + 3_400, T0 + 3_400) // 200 tokens in 0.9 s
 
-    // 300 tokens over 2 s, not the last step's 200.
-    expect(meter.final?.tps).toBeCloseTo(150, 5)
+    // 300 tokens over the 1.8 s of observed decode time, not the last step's 222.
+    expect(meter.final?.tps).toBeCloseTo(166.7, 1)
     expect(meter.final?.kind).toBe("turn")
 
     endTurn(meter, T0 + 3_500)
     expect(meter.history).toHaveLength(1)
-    expect(meter.history[0]!.tps).toBeCloseTo(150, 5)
+    expect(meter.history[0]!.tps).toBeCloseTo(166.7, 1)
   })
 
   test("folding off keeps each step's own figure", () => {
@@ -346,7 +461,7 @@ describe("turn fold", () => {
     endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100, opts)
     expect(meter.final?.kind).toBe("step")
     endTurn(meter, T0 + 2_200, opts)
-    expect(meter.history[0]!.tps).toBeCloseTo(100, 5)
+    expect(meter.history[0]!.tps).toBeCloseTo(111.1, 1)
   })
 
   test("closing a turn twice does not double-count it", () => {
@@ -571,7 +686,7 @@ describe("display", () => {
     expect(settled?.readings[0]!.label).toBe("↯")
     expect(settled?.readings[0]!.tps).toBeCloseTo(held, 5)
     expect(settled?.readings[1]!.label).toBe("μ")
-    expect(settled?.readings[1]!.tps).toBeCloseTo(100, 5)
+    expect(settled?.readings[1]!.tps).toBeCloseTo(111.1, 1)
   })
 
   test("a folded-off step keeps its check mark in both styles", () => {
@@ -594,7 +709,7 @@ describe("display", () => {
     const settled = display(meter, now + WINDOW + 100, ["sliding", "cumulative"], opts)
     expect(settled?.readings.map((reading) => reading.key)).toEqual(["cumulative"])
     expect(settled?.readings[0]!.live).toBe(false)
-    expect(settled?.readings[0]!.tps).toBeCloseTo(100, 5)
+    expect(settled?.readings[0]!.tps).toBeCloseTo(111.1, 1)
   })
 
   test("a new turn keeps both figures until something newer arrives", () => {

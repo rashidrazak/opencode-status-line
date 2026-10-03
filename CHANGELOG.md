@@ -39,6 +39,13 @@ and this project adheres to
   up to that ceiling. A shell command, tool run, permission prompt or question
   wait no longer drags the live average down while it runs, and slow-but-steady
   output still reads slow.
+- **The settled speed figure no longer counts tool time.** When a step settles,
+  its span is the observed decode clock, or the host's stream boundary — the
+  moment the provider response body ended, published before tool settlement —
+  for a step the plugin met mid-stream, before the step's own end and arrival
+  times. A shell command or any tool that ran after the response ended no
+  longer depresses the final figure, and a step whose span is unusable still
+  folds its exact tokens rather than being dropped.
 
 ## [1.1.0] - 2026-10-03
 

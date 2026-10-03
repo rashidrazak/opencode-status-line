@@ -24,9 +24,12 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   Until one lands, both segments draw zero figures rather than vanishing
   (`contextRuns`/`cacheRuns` in `src/render.ts`).
 - Exact token counts arrive only at `session.step.ended`; live figures are
-  estimates from stream deltas, calibrated at that point. Prefer the server's
-  `event.created` clock for step spans and fall back to local arrival times —
-  never mix the two (see `endStep` in `src/rate.ts`). Tool-argument deltas
+  estimates from stream deltas, calibrated at that point. The settled span
+  prefers the observed decode clock, then the host's `session.step.streamed`
+  boundary (`streamedAt` on the open step, published before tool settlement),
+  then the server's `event.created` span and, last, local arrival times —
+  never mixing clock domains (see `endStep` in `src/rate.ts`). Exact tokens
+  always fold when positive, even when no span is usable. Tool-argument deltas
   (`session.tool.input.delta`) count as output, and the decode span starts at
   the first token, so TTFT is not charged.
 

@@ -16,9 +16,12 @@
  *   cumulative  μ  the average since the turn began (exact tokens from every
  *                  finished step of the turn plus the step in flight)
  *
- * The settled figure folds the whole turn (configurable) and the sliding
- * reading holds its last value once a stream stops (`window.hold`), so the line
- * never loses its last figure at the finish line. A session met without a meter
+ * The settled figure measures decode time: its span prefers the observed decode
+ * clock, then the host's stream boundary (`session.step.streamed`, published
+ * before tool settlement), so time a tool spent running is not charged. It
+ * folds the whole turn (configurable) and the sliding reading holds its last
+ * value once a stream stops (`window.hold`), so the line never loses its last
+ * figure at the finish line. A session met without a meter
  * (a resume, a plugin reload) has its settled figure rebuilt from the last
  * turn's recorded messages, so the meter segment does not come back blank — it
  * shows the settled average over a resting `↯ 0.0` and an empty gauge. The
@@ -53,6 +56,7 @@ import {
   observe,
   peakTps,
   recordedSteps,
+  recordStreamed,
   restoreFinal,
   speedTone,
   tpsStats,
@@ -303,6 +307,20 @@ export default Plugin.define({
           // stamped by the same server, so the duration cannot mix clock domains.
           const started = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
           beginStep(meter(data.sessionID), data.assistantMessageID, started, Date.now())
+        }),
+      ),
+      context.data.on(
+        "session.step.streamed",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string" || typeof data?.assistantMessageID !== "string") return
+          // The provider response body ended here, before any tool it called
+          // settled. The host stamps `time.streamed` with the event's own
+          // clock, so only that stamp is comparable with the first-token one;
+          // a missing stamp leaves the step unstamped rather than mixing in a
+          // local clock the settlement span cannot use.
+          if (typeof event.created !== "number" || event.created <= 0) return
+          recordStreamed(meter(data.sessionID), data.assistantMessageID, event.created)
         }),
       ),
       context.data.on(

@@ -94,6 +94,21 @@ export interface Step {
   /** First token-bearing chunk on the local clock, for the fallback span. */
   tokenArrivedAt?: number
   /**
+   * Whether this process watched the step from its first token: the first
+   * delta it saw set `tokenAt` and started the decode clock together. A step
+   * seeded from the record arrives with `tokenAt` already set, so clock time
+   * accumulated later covers only part of the step and settlement must not
+   * prefer it.
+   */
+  fromFirstToken?: boolean
+  /**
+   * The host's stream boundary, on the event clock: `session.step.streamed`
+   * fires when the provider response body ends, before any tool it called
+   * settles. Settlement ends the decode span here when the decode clock is
+   * missing or unusable, so tool runtime is not charged to the step's figure.
+   */
+  streamedAt?: number
+  /**
    * Decode time of this step, in milliseconds: the sum of the observed
    * inter-delta gaps, each capped at `maxGapMs`. The live average's
    * denominator advances only here, so a pause in output holds the figure
@@ -183,6 +198,9 @@ export function observe(
     meter.step.decodeMs = (meter.step.decodeMs ?? 0) + counted
     meter.step.lastDeltaAt = now
     meter.step.chars += chars
+    // The first delta this process sees is the step's first token only when
+    // the marker is not already set: a seeded step arrives with `tokenAt`.
+    if (meter.step.tokenAt === undefined) meter.step.fromFirstToken = true
     meter.step.tokenAt ??= eventNow ?? now
     meter.step.tokenArrivedAt ??= now
   }
@@ -282,9 +300,56 @@ export function beginStep(meter: Meter, assistantMessageID: string, at: number, 
 }
 
 /**
+ * The host's stream boundary for a step arrived: the provider response body
+ * ended, before any tool it called settled. Recorded on the matching open step
+ * so settlement can end the decode span there. A boundary naming another step,
+ * or arriving with none open, is ignored — a straggler must not stamp the
+ * wrong span.
+ */
+export function recordStreamed(meter: Meter, assistantMessageID: string, at: number): void {
+  const step = meter.step
+  if (!step || step.assistantMessageID !== assistantMessageID) return
+  step.streamedAt = at
+}
+
+/**
+ * How long a finished step spent decoding, in milliseconds — the span the
+ * settled figure divides its exact tokens by.
+ *
+ * In priority order: the observed decode clock, when the step was watched from
+ * its first token and the sum is inside the validity bounds; the host's stream
+ * boundary minus that first token, when `session.step.streamed` was observed
+ * (the response body ends before its tools settle, so their runtime is not
+ * charged); then the `session.step.ended` span and the local arrival span, as
+ * before. `ended` is never preferred when a better stamp exists.
+ *
+ * The bounds choose a candidate, they never discard the step: when every
+ * candidate is out of range the most authoritative one is clamped into them,
+ * so the step's exact tokens still fold.
+ */
+function stepSpan(step: Step, endedAt: number, now: number): number {
+  const startAt = step.tokenAt ?? step.at
+  const startArrived = step.tokenArrivedAt ?? step.arrivedAt
+  const candidates: number[] = []
+  // The decode clock only measures a step watched from its first token:
+  // observing the first delta is what sets `tokenAt` and `fromFirstToken`.
+  if (step.fromFirstToken && step.decodeMs !== undefined) candidates.push(step.decodeMs)
+  if (step.streamedAt !== undefined) candidates.push(step.streamedAt - startAt)
+  candidates.push(endedAt - startAt)
+  candidates.push(now - startArrived)
+  const usable = candidates.find((ms) => ms >= MIN_STEP_MS && ms <= MAX_STEP_MS)
+  if (usable !== undefined) return usable
+  return Math.min(Math.max(candidates[0]!, MIN_STEP_MS), MAX_STEP_MS)
+}
+
+/**
  * A step finished with exact `tokens` of output (output + reasoning). Folds it
  * into the turn when folding is on, so the figure is the turn's weighted
  * average rather than one step's, and returns what should be shown.
+ *
+ * The span measures decode time alone (see `stepSpan`), and exact tokens are
+ * always folded when positive: a step with no usable span still contributes
+ * its tokens, with the duration replaced or clamped.
  */
 export function endStep(
   meter: Meter,
@@ -297,16 +362,7 @@ export function endStep(
   const step = meter.step
   meter.step = undefined
   if (!step || step.assistantMessageID !== assistantMessageID || tokens <= 0) return undefined
-  // Prefer the server's own clock for both ends; if those stamps are unusable
-  // (unit drift, replayed event), fall back to when the events actually arrived
-  // — never mixed, and a nonsense figure never reaches the screen. The span
-  // starts at the first token: TTFT is not the model's speed.
-  const startAt = step.tokenAt ?? step.at
-  const startArrived = step.tokenArrivedAt ?? step.arrivedAt
-  const eventMs = endedAt - startAt
-  const arrivalMs = now - startArrived
-  const ms = eventMs >= MIN_STEP_MS && eventMs <= MAX_STEP_MS ? eventMs : arrivalMs
-  if (ms < MIN_STEP_MS || ms > MAX_STEP_MS) return undefined
+  const ms = stepSpan(step, endedAt, now)
   const seconds = ms / 1000
 
   const stepTps = tokens / seconds

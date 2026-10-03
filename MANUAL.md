@@ -301,7 +301,7 @@ corrects the estimate against the exact counts as they arrive.
 | --- | --- | --- |
 | Sliding | `↯` | Speed over the last few seconds — what is happening right now |
 | Cumulative | `μ` or `avg` | Average across this turn so far: exact tokens from finished steps plus the step in flight, over the time spent producing tokens |
-| Settled | `μ` / `avg` / `✓` | The final figure from a finished step or turn, kept on screen |
+| Settled | `μ` / `avg` / `✓` | The final figure from a finished step or turn, kept on screen; measured on decode time, so tool runtime is not charged |
 
 ### Which readings you see
 
@@ -342,6 +342,14 @@ newest delta does, so the figure holds still through a shell command, tool run,
 permission prompt or question wait and resumes when tokens do. A single pause
 longer than `window.maxGapMs` counts only up to that ceiling, so a provider
 stall cannot crater the figure; set it to `0` to count pauses in full.
+
+The figure a step settles with keeps the same basis: its span ends at the
+observed decode clock when the stream was watched from its first token, or at
+the host's stream boundary — the moment the provider response body ended — when
+the plugin met the step mid-stream; only without either does it fall back to
+the step's own end and arrival times. A shell command or any tool the step
+called therefore does not depress the settled figure, and a step with no usable
+span still folds its exact tokens rather than being dropped.
 
 ### The gauge
 
