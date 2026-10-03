@@ -8,34 +8,39 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-03
+
 ### Changed
 
-- The npm entry is now built rather than transpiled on load. `bun run
-  build:entry` compiles `src/tui.tsx` with OpenTUI's own Solid plugin into
-  `dist/tui.js`, which imports `@opentui/solid` by name and leaves the host's
-  runtime external; `exports` and `files` point npm consumers at it. A package
-  install no longer compiles the JSX at load against a runtime OpenCode did not
-  build — the mismatch behind the `Failed to create TextBuffer` crashes and the
-  native-handle leak that filled the renderer's table. A checkout install is
-  unchanged: the directory path still runs `src/tui.tsx`, which OpenCode
-  transforms itself. CI builds the entry before checking the tarball, and
-  `check:pack` now also refuses a tarball whose packed entry resolves its JSX
-  runtime at load.
+- npm installs now receive a ready-to-run file instead of the plugin's source,
+  so OpenCode no longer has to prepare the plugin while it starts. Installing
+  from a folder still uses the source. Nothing to do on your side: update the
+  version and restart OpenCode as usual.
 
 ### Fixed
 
-- A drawing step that throws no longer costs the whole line — and with it the
-  session. Each step now degrades on its own: an ink that cannot be resolved
-  draws the run in the terminal's default colour, a segment whose data cannot
-  be read is skipped while the rest of the line stays, a row that cannot be
-  built is drawn as plain text, and a build that fails holds the figures it
-  drew last (dimmed, to say they are not from this paint) and tries again on
-  the next paint. When nothing at all can be drawn the line shows a muted `⚠`.
-  After three consecutive failures of the renderables themselves it stops
-  trying and logs a single warning: an OpenTUI repaint that throws after
-  allocating abandons its native objects, so a host that cannot draw the line
-  would otherwise exhaust the renderer's 65,534-handle pool and take the TUI
-  down minutes later with `Failed to create TextBuffer`.
+- **Installing from npm no longer crashes OpenCode, and the line now appears.**
+  When the plugin was installed from npm — the way the README recommends — the
+  status line stayed blank, and a few minutes into a session OpenCode could
+  close itself with `Error: Failed to create TextBuffer`. OpenCode prepared the
+  plugin while starting, and the plugin then drew with its own copy of the
+  drawing library instead of OpenCode's; that drawing failed, and every failed
+  attempt used up a little of the renderer's fixed supply of drawing objects.
+  Once the supply ran out, OpenCode stopped. The plugin now arrives ready to
+  run and draws with OpenCode's own library, so nothing is prepared or guessed
+  at start-up. Installing from a folder (a checkout) was never affected and
+  behaves exactly as before.
+- **One thing going wrong while drawing no longer costs you the line — or your
+  session.** Each part of the line now fails on its own and falls back to
+  something simpler: a colour that cannot be worked out is left to your
+  terminal, a reading that cannot be worked out is skipped while the rest of
+  the line stays, figures that cannot be refreshed stay on screen from the last
+  successful draw (dimmed, so you can see they are not new), and a row that
+  cannot be drawn properly is drawn as plain text. If nothing at all can be
+  drawn, the line shows a single `⚠` instead of vanishing. And if the drawing
+  is broken past that point, the plugin stops after three attempts and writes
+  one warning instead of retrying forever — the retries were what drained the
+  renderer and closed OpenCode.
 
 ## [1.0.2] - 2026-10-02
 
@@ -89,7 +94,8 @@ Initial release.
   project's `.opencode-status-line.json` and plugin entry options, validated
   with warnings that never break the line
 
-[Unreleased]: https://github.com/rashidrazak/opencode-status-line/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/rashidrazak/opencode-status-line/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.1.0
 [1.0.2]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.0.2
 [1.0.1]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rashidrazak/opencode-status-line/releases/tag/v1.0.0
