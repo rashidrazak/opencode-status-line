@@ -3,12 +3,14 @@ import {
   active,
   adoptMeter,
   beginStep,
+  beginToolInput,
   beginTurn,
   createMeter,
   cumulativeRate,
   deliver,
   display,
   endStep,
+  endToolInput,
   endTurn,
   failStep,
   formatRate,
@@ -601,6 +603,57 @@ describe("step retry", () => {
     beginStep(meter, "b", T0 + 2_000, T0 + 2_000)
     expect(meter.step).toEqual({ assistantMessageID: "b", outputChars: 0, reasoningChars: 0, at: T0 + 2_000, arrivedAt: T0 + 2_000 })
     expect(cumulativeRate(meter, T0 + 2_000)).toBeUndefined()
+  })
+})
+
+describe("tool argument windows", () => {
+  test("charges argument generation the deltas never see", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 100, 40) // the first delta starts the clock
+    observe(meter, T0 + 200, 80) // decode: 100 ms
+    beginToolInput(meter, "msg", T0 + 200)
+    endToolInput(meter, "msg", T0 + 450, OPTS) // +250 ms of argument generation
+    expect(meter.step?.decodeMs).toBe(350)
+    recordStreamed(meter, "msg", T0 + 500)
+    // 240 exact tokens — the arguments included — over the 350 ms the clock
+    // now covers, not the 100 ms the deltas alone did.
+    expect(endStep(meter, "msg", { output: 240 }, T0 + 600, T0 + 600)).toBeCloseTo(240 / 0.35, 5)
+  })
+
+  test("drops the gap between calls, so tool runtime is never charged", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 100, 40)
+    beginToolInput(meter, "msg", T0 + 100)
+    endToolInput(meter, "msg", T0 + 300, OPTS) // 200 ms of arguments
+    beginToolInput(meter, "msg", T0 + 5_000) // a tool ran for 4.7 s in between
+    endToolInput(meter, "msg", T0 + 5_200, OPTS) // 200 ms of arguments
+    expect(meter.step?.decodeMs).toBe(400)
+  })
+
+  test("deltas inside a window keep their own gaps; the end charges the remainder", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 100, 40)
+    beginToolInput(meter, "msg", T0 + 100)
+    observe(meter, T0 + 150, 20) // +50
+    observe(meter, T0 + 250, 20) // +100
+    endToolInput(meter, "msg", T0 + 400, OPTS) // +150
+    expect(meter.step?.decodeMs).toBe(300)
+  })
+
+  test("caps a window at the ceiling and ignores ends without starts or another message", () => {
+    const meter = createMeter()
+    beginToolInput(meter, "msg", T0) // no step open: ignored
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0 + 100, 40)
+    beginToolInput(meter, "other", T0 + 100) // another message's dialog: ignored
+    beginToolInput(meter, "msg", T0 + 100)
+    endToolInput(meter, "msg", T0 + 10_100, OPTS) // a 10 s window: the ceiling applies
+    expect(meter.step?.decodeMs).toBe(3_000)
+    endToolInput(meter, "msg", T0 + 11_000, OPTS) // no window open: a no-op
+    expect(meter.step?.decodeMs).toBe(3_000)
   })
 })
 

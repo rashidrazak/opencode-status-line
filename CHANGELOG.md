@@ -89,6 +89,15 @@ and this project adheres to
   fold, so the statistics dialog gets one turn sample per queued prompt instead
   of a merged average. A mid-turn steer is not a boundary: it stays part of the
   turn it corrects and never splits the average.
+- **Tool-call argument generation now counts toward a settled step.** Some
+  providers stream no per-chunk `session.tool.input.delta` events, so the
+  decode clock stopped at the last text or reasoning delta while the argument
+  tokens still counted in the step's exact output — a short step could settle
+  faster than the model produced it. The meter now charges the argument
+  stream's window — `session.tool.input.started` to `session.tool.input.ended`
+  — to the decode clock, capped by `window.maxGapMs` like any other gap. Tool
+  runtime still does not count: execution begins only after the argument
+  window closes.
 
 ## [1.1.0] - 2026-10-03
 

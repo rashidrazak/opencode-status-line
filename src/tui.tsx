@@ -51,11 +51,13 @@ import {
   active,
   adoptMeter,
   beginStep,
+  beginToolInput,
   beginTurn,
   createMeter,
   deliver,
   display,
   endStep,
+  endToolInput,
   endTurn,
   failStep,
   firstTokenAt,
@@ -354,6 +356,29 @@ export default Plugin.define({
       // output class, the host's own split, so a large file or command being
       // written keeps the meter honest without teaching the reasoning ratio.
       context.data.on("session.tool.input.delta", safely(onDelta("tool"))),
+      // A tool call's argument stream. The host publishes the window's
+      // boundaries even when it publishes no per-chunk deltas — this host and
+      // provider stream none — and argument tokens are part of the step's
+      // exact output, so the window is charged to the step's decode clock:
+      // the opening boundary pauses ordinary gap accounting, the closing one
+      // charges the window. Execution starts at `session.tool.called`, after
+      // the closing boundary, so tool runtime still is not charged.
+      context.data.on(
+        "session.tool.input.started",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string") return
+          beginToolInput(meter(data.sessionID), data.assistantMessageID, Date.now())
+        }),
+      ),
+      context.data.on(
+        "session.tool.input.ended",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string") return
+          endToolInput(meter(data.sessionID), data.assistantMessageID, Date.now(), opts)
+        }),
+      ),
       context.data.on(
         "session.step.started",
         safely((event: Event) => {

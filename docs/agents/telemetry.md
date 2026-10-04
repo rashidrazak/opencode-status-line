@@ -46,7 +46,22 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   never mixing clock domains (see `endStep` in `src/rate.ts`). Exact tokens
   always fold when positive, even when no span is usable. Tool-argument deltas
   (`session.tool.input.delta`) count as output, and the decode span starts at
-  the first token, so TTFT is not charged.
+  the first token, so TTFT is not charged. Not every provider streams those
+  deltas — this host emits only the window boundaries,
+  `session.tool.input.started` and `.ended`, for some models — while argument
+  tokens still count in the step's exact `output`. The boundaries therefore
+  feed the decode clock (`beginToolInput`/`endToolInput` in `src/rate.ts`): the
+  opening boundary drops the interval since the last tick — a previous call's
+  execution can sit there — and the closing boundary charges the window,
+  capped by `window.maxGapMs` like any other gap, so the argument tokens are
+  not divided by a span that stopped early. Execution starts at
+  `session.tool.called`, after the closing boundary, so tool runtime is still
+  never charged. Known inclusion: a provider that buffers a response and
+  flushes it in one or two chunks gives the decode clock only the flush window
+  — the host's own part and stream stamps agree, so no bus event separates
+  them; measured on the `commandcode` provider, a first response's whole
+  reasoning part was recorded as an 8 ms flash. The settled figure is then the
+  flush rate, documented in the manual rather than guessed around.
 - A failed step settles on `session.step.failed`: the exact tokens the event
   reports fold in when it carries any, and the matching open step clears either
   way (`failStep` in `src/rate.ts`), so a failure neither lingers until turn

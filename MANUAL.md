@@ -348,7 +348,20 @@ streamed deltas counts when the later delta arrives, and nothing after the
 newest delta does, so the figure holds still through a shell command, tool run,
 permission prompt or question wait and resumes when tokens do. A single pause
 longer than `window.maxGapMs` counts only up to that ceiling, so a provider
-stall cannot crater the figure; set it to `0` to count pauses in full.
+stall cannot crater the figure; set it to `0` to count pauses in full. A tool
+call's argument generation counts too, even when the provider streams no
+per-chunk tool-input events: the window between `session.tool.input.started`
+and `session.tool.input.ended` is charged when it closes, so argument tokens
+are not divided by a span that stopped early. Tool runtime still does not
+count — execution begins after that window.
+
+One limit is worth knowing: the meter measures when tokens arrive, not when the
+model produced them. A provider that buffers a response and delivers it in one
+or two chunks gives the line nothing to measure but the flush, so a buffered
+first response can read faster than the model's steady pace; once responses
+stream normally, the figure returns to the true arrival rate. The host's own
+timestamps see the same flush, so there is nothing better available on this
+side.
 
 The figure a step settles with keeps the same basis: its span ends at the
 observed decode clock when the stream was watched from its first token, or at

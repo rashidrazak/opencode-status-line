@@ -140,13 +140,20 @@ export interface Step {
   streamedAt?: number
   /**
    * Decode time of this step, in milliseconds: the sum of the observed
-   * inter-delta gaps, each capped at `maxGapMs`. The live average's
-   * denominator advances only here, so a pause in output holds the figure
-   * instead of decaying.
+   * inter-delta gaps and tool-argument windows (see `beginToolInput`), each
+   * capped at `maxGapMs`. The live average's denominator advances only here,
+   * so a pause in output holds the figure instead of decaying.
    */
   decodeMs?: number
   /** Local arrival of the newest observed delta; the next gap is measured from here. */
   lastDeltaAt?: number
+  /**
+   * Local arrival of a tool-argument stream's opening boundary, while that
+   * stream runs. Its closing boundary charges the window to `decodeMs`; it is
+   * tracked separately from `lastDeltaAt` so an end without a start can never
+   * charge a tool's execution time.
+   */
+  toolOpenAt?: number
 }
 
 /** Exact decode totals of the turn in flight: finished steps only. */
@@ -385,10 +392,12 @@ export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_
  *
  * The denominator is the step's decode clock, not wall-clock time: each gap
  * between observed deltas counts up to `maxGapMs` when the later delta lands,
- * and nothing after the newest delta does. The figure therefore holds still
- * while output is paused — a shell command, any tool, a permission or question
- * wait — and resumes with the next delta. `now` is accepted as the caller's
- * clock but deliberately does not advance the span.
+ * a tool-argument window counts when its closing boundary lands (see
+ * `beginToolInput`/`endToolInput`), and nothing after the newest tick does.
+ * The figure therefore holds still while output is paused — a shell command,
+ * any tool, a permission or question wait — and resumes with the next token.
+ * `now` is accepted as the caller's clock but deliberately does not advance
+ * the span.
  */
 export function cumulativeRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): number | undefined {
   const step = meter.step
@@ -431,6 +440,52 @@ export function recordStreamed(meter: Meter, assistantMessageID: string, at: num
   const step = meter.step
   if (!step || step.assistantMessageID !== assistantMessageID) return
   step.streamedAt = at
+}
+
+/**
+ * A tool call's argument stream began on the open step.
+ *
+ * Tool-argument output is counted in the step's exact `output` tokens, but
+ * this host publishes no `session.tool.input.delta` per chunk for every
+ * provider — only the opening and closing boundaries. Without them the decode
+ * clock stops at the last text or reasoning delta, and the settled figure
+ * would divide the argument tokens by too short a span. The interval since
+ * the previous tick is deliberately dropped rather than charged: a previous
+ * call's execution can sit between its argument stream and the next, and
+ * execution is not the model's time. Argument generation starts immediately
+ * after the last delta in practice, so almost nothing is lost, and the clock
+ * resumes at this boundary.
+ */
+export function beginToolInput(meter: Meter, assistantMessageID: string | undefined, now: number): void {
+  const step = meter.step
+  if (!step) return
+  if (assistantMessageID !== undefined && step.assistantMessageID !== assistantMessageID) return
+  step.toolOpenAt = now
+  step.lastDeltaAt = now
+}
+
+/**
+ * A tool call's argument stream ended: charge the window just passed to the
+ * step's decode clock, capped by `maxGapMs` like any other gap. Deltas that
+ * arrived inside the window already advanced the clock, so only the time
+ * since the newest tick is charged. The call itself executes after this
+ * boundary (`session.tool.called`), so its runtime still is not charged.
+ */
+export function endToolInput(
+  meter: Meter,
+  assistantMessageID: string | undefined,
+  now: number,
+  opts: RateOptions = DEFAULT_RATE,
+): void {
+  const step = meter.step
+  if (!step) return
+  if (assistantMessageID !== undefined && step.assistantMessageID !== assistantMessageID) return
+  if (step.toolOpenAt === undefined) return
+  step.toolOpenAt = undefined
+  const gap = Math.max(0, now - (step.lastDeltaAt ?? now))
+  const counted = opts.maxGapMs > 0 ? Math.min(gap, opts.maxGapMs) : gap
+  step.decodeMs = (step.decodeMs ?? 0) + counted
+  step.lastDeltaAt = now
 }
 
 /**
