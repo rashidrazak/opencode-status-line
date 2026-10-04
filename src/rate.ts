@@ -38,11 +38,11 @@ export interface RateOptions {
   minTps: number
   /** Character samples land in buckets of this size; finer granularity is only noise. */
   bucketMs: number
-  /** Whether finished steps teach the estimate its characters-per-token ratio. */
+  /** Whether finished steps teach the estimate its characters-per-token ratios. */
   calibrate: boolean
-  /** Seed ratio, used until calibration has something to say. */
+  /** Seed ratio for both classes, used until calibration has something to say. */
   charsPerToken: number
-  /** Bounds for the calibrated ratio; a sample outside them is discarded. */
+  /** Bounds for the calibrated ratios; an accumulated ratio outside them is discarded. */
   ratioMin: number
   ratioMax: number
   /** Accumulate a turn's exact steps into one weighted figure. */
@@ -77,20 +77,38 @@ const MIN_STEP_MS = 50
 /** Longest decode span trusted; beyond this a clock is lying. */
 const MAX_STEP_MS = 3_600_000
 
-/** A step needs this much streamed text before its ratio is worth calibrating from. */
+/**
+ * A class accumulates this much streamed text before its ratio is worth
+ * calibrating from, so several small steps teach the ratio together.
+ */
 const RATIO_MIN_CHARS = 40
 /** Exponential moving average weight given to a fresh ratio. */
 const RATIO_WEIGHT = 0.3
 
+/** Which stream a delta arrived on: text and tool input both feed the output ratio. */
+export type DeltaSource = "text" | "reasoning" | "tool"
+
 export interface Sample {
   /** Bucket start, aligned to bucketMs. */
   at: number
+  /** Visible output characters in the bucket: text plus tool input. */
+  outputChars: number
+  /** Reasoning characters in the bucket. */
+  reasoningChars: number
+}
+
+/** Characters and exact tokens one class has accumulated for its next ratio update. */
+export interface RatioEvidence {
   chars: number
+  tokens: number
 }
 
 export interface Step {
   assistantMessageID: string
-  chars: number
+  /** Streamed visible output characters: text plus tool input. */
+  outputChars: number
+  /** Streamed reasoning characters. */
+  reasoningChars: number
   /** Step start on the event clock. */
   at: number
   /** Step start on the local clock, for when the event clock is unusable. */
@@ -163,8 +181,15 @@ export interface Meter {
   step?: Step
   /** The turn's exact fold, when turn folding is on. */
   turn: Turn
-  /** Estimated characters per token, calibrated from finished steps. */
-  charsPerToken: number
+  /** Estimated visible output characters per token, calibrated from finished steps. */
+  outputCharsPerToken: number
+  /** Estimated reasoning characters per token, calibrated from finished steps. */
+  reasoningCharsPerToken: number
+  /**
+   * Characters and exact tokens each class has accumulated since its ratio's
+   * last update. Held across steps so a run of small steps still teaches.
+   */
+  evidence: { output: RatioEvidence; reasoning: RatioEvidence }
   /** Last settled figure, shown until something newer replaces it. */
   final?: Final
   /**
@@ -188,13 +213,53 @@ export function createMeter(opts: RateOptions = DEFAULT_RATE): Meter {
     samples: [],
     lastDeltaAt: 0,
     turn: { tokens: 0, ms: 0 },
-    charsPerToken: opts.charsPerToken,
+    outputCharsPerToken: opts.charsPerToken,
+    reasoningCharsPerToken: opts.charsPerToken,
+    evidence: { output: { chars: 0, tokens: 0 }, reasoning: { chars: 0, tokens: 0 } },
     history: [],
   }
 }
 
+/** The unsplit fields a sample or step carried before the class ratios. */
+interface LegacyChars {
+  chars?: number
+  outputChars?: number
+  reasoningChars?: number
+}
+
+/**
+ * Brings a meter created before the class split forward, in place. The meter
+ * map rides on `globalThis` across plugin hot reloads, so a save mid-stream
+ * hands the new generation meters of the old shape, whose missing fields would
+ * otherwise read as NaN estimates. The old single ratio seeds both classes;
+ * the old counts never distinguished reasoning from output, so they count as
+ * visible output; the per-class evidence starts empty. Returns the same meter.
+ */
+export function adoptMeter(meter: Meter): Meter {
+  const legacy = meter as Meter & { charsPerToken?: number }
+  meter.outputCharsPerToken ??= legacy.charsPerToken ?? DEFAULT_RATE.charsPerToken
+  meter.reasoningCharsPerToken ??= legacy.charsPerToken ?? DEFAULT_RATE.charsPerToken
+  meter.evidence ??= { output: { chars: 0, tokens: 0 }, reasoning: { chars: 0, tokens: 0 } }
+  for (const sample of meter.samples as (Sample & LegacyChars)[]) {
+    sample.outputChars ??= sample.chars ?? 0
+    sample.reasoningChars ??= 0
+    delete sample.chars
+  }
+  const step = meter.step as (Step & LegacyChars) | undefined
+  if (step) {
+    step.outputChars ??= step.chars ?? 0
+    step.reasoningChars ??= 0
+    delete step.chars
+  }
+  return meter
+}
+
 /**
  * Records `chars` of streamed output arriving at `now` (event clock optional).
+ *
+ * `source` says which stream the delta arrived on — text, reasoning or tool
+ * input — so the classes accumulate and convert at their own calibrated
+ * ratios; tool input counts as visible output, the host's own split.
  *
  * `assistantMessageID` names the step the delta came from. When the events
  * carry one it must match the open step: output from a step that already
@@ -208,13 +273,19 @@ export function observe(
   eventNow?: number,
   opts: RateOptions = DEFAULT_RATE,
   assistantMessageID?: string,
+  source: DeltaSource = "text",
 ): void {
   if (chars <= 0) return
   if (assistantMessageID !== undefined && meter.step?.assistantMessageID !== assistantMessageID) return
+  const reasoning = source === "reasoning"
   const at = Math.floor(now / opts.bucketMs) * opts.bucketMs
   const last = meter.samples[meter.samples.length - 1]
-  if (last && last.at === at) last.chars += chars
-  else meter.samples.push({ at, chars })
+  if (last && last.at === at) {
+    if (reasoning) last.reasoningChars += chars
+    else last.outputChars += chars
+  } else {
+    meter.samples.push({ at, outputChars: reasoning ? 0 : chars, reasoningChars: reasoning ? chars : 0 })
+  }
   if (meter.step) {
     // The decode clock: every observed gap advances the step's decode time,
     // the first delta starting it at zero. Time since the newest delta is
@@ -224,7 +295,8 @@ export function observe(
     const counted = opts.maxGapMs > 0 ? Math.min(gap, opts.maxGapMs) : gap
     meter.step.decodeMs = (meter.step.decodeMs ?? 0) + counted
     meter.step.lastDeltaAt = now
-    meter.step.chars += chars
+    if (reasoning) meter.step.reasoningChars += chars
+    else meter.step.outputChars += chars
     // The first delta this process sees is the step's first token only when
     // the marker is not already set: a seeded step arrives with `tokenAt`.
     if (meter.step.tokenAt === undefined) meter.step.fromFirstToken = true
@@ -248,6 +320,14 @@ export function notePeak(meter: Meter, tps: number): void {
   if (tps > (meter.peak ?? 0)) meter.peak = tps
 }
 
+/**
+ * Converts a class pair into estimated tokens: visible output characters and
+ * reasoning characters, each divided by the ratio its own class calibrated.
+ */
+function estimatedTokens(meter: Meter, outputChars: number, reasoningChars: number): number {
+  return outputChars / meter.outputCharsPerToken + reasoningChars / meter.reasoningCharsPerToken
+}
+
 function prune(meter: Meter, now: number, opts: RateOptions): void {
   // The left edge is open: a bucket exactly one window old has aged out, so a
   // reading works from the deltas the covered span actually holds.
@@ -257,8 +337,8 @@ function prune(meter: Meter, now: number, opts: RateOptions): void {
 
 /**
  * The sliding estimate: streamed characters over the span the retained deltas
- * actually cover, divided by the calibrated ratio, and read as whichever of
- * two views is lower:
+ * actually cover — each class converted at its own calibrated ratio — and read
+ * as whichever of two views is lower:
  *
  * - inter-arrival — what streamed after the oldest retained delta over the span
  *   between the retained deltas themselves. The oldest sample's characters are
@@ -279,14 +359,14 @@ export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_
   const oldest = meter.samples[0]!
   const newest = meter.samples[meter.samples.length - 1]!
   let total = 0
-  for (const sample of meter.samples) total += sample.chars
-  const afterOldest = total - oldest.chars
+  for (const sample of meter.samples) total += estimatedTokens(meter, sample.outputChars, sample.reasoningChars)
+  const afterOldest = total - estimatedTokens(meter, oldest.outputChars, oldest.reasoningChars)
   // The span floor damps the first instants of a stream, and the window caps
   // both spans so no estimate leans on output older than it looks back over.
   const interSpan = Math.min(Math.max(newest.at - oldest.at, opts.minSpanMs), opts.windowMs)
   const densitySpan = Math.min(Math.max(now - oldest.at, opts.minSpanMs), opts.windowMs)
-  const inter = afterOldest / meter.charsPerToken / (interSpan / 1000)
-  const density = total / meter.charsPerToken / (densitySpan / 1000)
+  const inter = afterOldest / (interSpan / 1000)
+  const density = total / (densitySpan / 1000)
   const tps = Math.min(inter, density)
   if (tps < opts.minTps) return undefined
   meter.sliding = { tps, at: now }
@@ -295,9 +375,10 @@ export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_
 
 /**
  * The cumulative average: every exact token of this turn's finished steps plus
- * the characters of the step in flight, over the decode time they took. With
- * turn folding off it describes the current step alone. Live only — it needs a
- * step that has emitted its first token.
+ * the step in flight — its output and reasoning characters each at their own
+ * calibrated ratio — over the decode time they took. With turn folding off it
+ * describes the current step alone. Live only — it needs a step that has
+ * emitted its first token.
  *
  * The denominator is the step's decode clock, not wall-clock time: each gap
  * between observed deltas counts up to `maxGapMs` when the later delta lands,
@@ -311,7 +392,9 @@ export function cumulativeRate(meter: Meter, now: number, opts: RateOptions = DE
   if (!step) return undefined
   // Steps that stream tool arguments expose no deltas on the bus, so their
   // first-token marker never lands — and their decode clock stays at zero.
-  const tokens = meter.turn.tokens + step.chars / meter.charsPerToken
+  // The step in flight is estimated per class, so reasoning chars do not ride
+  // the output ratio or the reverse.
+  const tokens = meter.turn.tokens + estimatedTokens(meter, step.outputChars, step.reasoningChars)
   const ms = meter.turn.ms + (step.decodeMs ?? 0)
   if (ms < opts.minSpanMs || tokens <= 0) return undefined
   const tps = tokens / (ms / 1000)
@@ -331,7 +414,7 @@ export function beginStep(meter: Meter, assistantMessageID: string, at: number, 
   // The previous figure deliberately stays on screen while this step finds its
   // feet (TTFT, tools): continuity beats a blank line, and the live estimates
   // replace it the moment this step streams.
-  meter.step = { assistantMessageID, chars: 0, at, arrivedAt }
+  meter.step = { assistantMessageID, outputChars: 0, reasoningChars: 0, at, arrivedAt }
 }
 
 /**
@@ -378,9 +461,41 @@ function stepSpan(step: Step, endedAt: number, now: number): number {
 }
 
 /**
- * A step finished with exact `tokens` of output (output + reasoning). Folds it
- * into the turn when folding is on, so the figure is the turn's weighted
- * average rather than one step's, and returns what should be shown.
+ * The exact token split a settled step reports, as the host keeps it: visible
+ * `output` — tool input included — and `reasoning`. Both optional so a failure
+ * that carries nothing can still close its step.
+ */
+export interface TokenSplit {
+  output?: number
+  reasoning?: number
+}
+
+/**
+ * Adds a class's characters and exact tokens to its evidence; once the class
+ * has accumulated `RATIO_MIN_CHARS` of text, returns the ratio it just
+ * measured. Returns undefined while the evidence is still short, or when the
+ * ratio falls outside the configured bounds. Evidence is cleared once a
+ * measurement was possible, so an out-of-bounds ratio is discarded and the
+ * next update starts fresh, and small steps are held rather than ignored.
+ */
+function calibrate(evidence: RatioEvidence, chars: number, tokens: number, opts: RateOptions): number | undefined {
+  if (chars <= 0 || tokens <= 0) return undefined
+  evidence.chars += chars
+  evidence.tokens += tokens
+  if (evidence.chars < RATIO_MIN_CHARS) return undefined
+  const ratio = evidence.chars / evidence.tokens
+  evidence.chars = 0
+  evidence.tokens = 0
+  return ratio >= opts.ratioMin && ratio <= opts.ratioMax ? ratio : undefined
+}
+
+/**
+ * A step finished with its exact token split. Folds the total into the turn
+ * when folding is on, so the figure is the turn's weighted average rather than
+ * one step's, and returns what should be shown. Each class's evidence also
+ * teaches its own ratio here — output characters over exact output tokens,
+ * reasoning characters over exact reasoning tokens — accumulated across steps
+ * and bounded exactly as the single ratio was.
  *
  * The span measures decode time alone (see `stepSpan`), and exact tokens are
  * always folded when positive: a step with no usable span still contributes
@@ -389,20 +504,23 @@ function stepSpan(step: Step, endedAt: number, now: number): number {
 export function endStep(
   meter: Meter,
   assistantMessageID: string,
-  tokens: number,
+  tokens: TokenSplit,
   endedAt: number,
   now: number,
   opts: RateOptions = DEFAULT_RATE,
 ): number | undefined {
   const step = meter.step
   meter.step = undefined
-  if (!step || step.assistantMessageID !== assistantMessageID || tokens <= 0) return undefined
+  const output = tokens.output ?? 0
+  const reasoning = tokens.reasoning ?? 0
+  const total = output + reasoning
+  if (!step || step.assistantMessageID !== assistantMessageID || total <= 0) return undefined
   const ms = stepSpan(step, endedAt, now)
   const seconds = ms / 1000
 
-  const stepTps = tokens / seconds
+  const stepTps = total / seconds
   if (opts.turnFold) {
-    meter.turn.tokens += tokens
+    meter.turn.tokens += total
     meter.turn.ms += seconds * 1000
   }
   const folded = opts.turnFold && meter.turn.ms > 0
@@ -411,14 +529,19 @@ export function endStep(
     tps,
     at: now,
     kind: folded ? "turn" : "step",
-    tokens: folded ? meter.turn.tokens : tokens,
+    tokens: folded ? meter.turn.tokens : total,
     ms: folded ? meter.turn.ms : ms,
   }
   notePeak(meter, tps)
-  if (opts.calibrate && step.chars >= RATIO_MIN_CHARS) {
-    const ratio = step.chars / tokens
-    if (ratio >= opts.ratioMin && ratio <= opts.ratioMax) {
-      meter.charsPerToken = meter.charsPerToken * (1 - RATIO_WEIGHT) + ratio * RATIO_WEIGHT
+  if (opts.calibrate) {
+    const outputRatio = calibrate(meter.evidence.output, step.outputChars, output, opts)
+    if (outputRatio !== undefined) {
+      meter.outputCharsPerToken = meter.outputCharsPerToken * (1 - RATIO_WEIGHT) + outputRatio * RATIO_WEIGHT
+    }
+    const reasoningRatio = calibrate(meter.evidence.reasoning, step.reasoningChars, reasoning, opts)
+    if (reasoningRatio !== undefined) {
+      meter.reasoningCharsPerToken =
+        meter.reasoningCharsPerToken * (1 - RATIO_WEIGHT) + reasoningRatio * RATIO_WEIGHT
     }
   }
   return tps
@@ -435,14 +558,14 @@ export function endStep(
 export function failStep(
   meter: Meter,
   assistantMessageID: string,
-  tokens: number,
+  tokens: TokenSplit,
   endedAt: number,
   now: number,
   opts: RateOptions = DEFAULT_RATE,
 ): number | undefined {
   const step = meter.step
   if (!step || step.assistantMessageID !== assistantMessageID) return undefined
-  if (tokens <= 0) {
+  if ((tokens.output ?? 0) + (tokens.reasoning ?? 0) <= 0) {
     // The failure reported nothing exact: there is nothing to fold, so the
     // step simply clears rather than being kept alive to decay.
     meter.step = undefined

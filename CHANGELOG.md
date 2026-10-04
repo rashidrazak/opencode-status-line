@@ -26,6 +26,17 @@ and this project adheres to
 
 ### Fixed
 
+- **The live speed estimate now converts visible output and reasoning at
+  separate calibrated ratios.** The plugin learned one characters-per-token
+  ratio from finished steps, but reasoning and output have different
+  characters-per-token densities, so a single ratio skewed the estimate
+  whenever a model reasoned. The meter now keeps an output ratio — text and
+  tool input together, the host's own split — and a reasoning ratio, each
+  seeded from `calibration.charsPerToken`, bounded by the same
+  `calibration.min`/`calibration.max`, and updated from a settled step's exact
+  output and reasoning token counts. A class accumulates characters across
+  steps, so a run of small steps still teaches its ratio instead of being
+  ignored.
 - **The live speed reading (`↯`) now tells the truth on slow and stalled
   streams.** It is estimated over the span the retained stream deltas actually
   cover, so output arriving a second or two apart reads its real pace instead of

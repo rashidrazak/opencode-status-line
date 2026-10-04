@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   active,
+  adoptMeter,
   beginStep,
   beginTurn,
   createMeter,
@@ -21,6 +22,7 @@ import {
   tpsStats,
   DEFAULT_RATE,
   USAGE_LABELS,
+  type DeltaSource,
   type Meter,
   type RateOptions,
   type RecordedMessage,
@@ -32,18 +34,19 @@ const T0 = 1_000_000
 const WINDOW = DEFAULT_RATE.windowMs
 const OPTS: RateOptions = { ...DEFAULT_RATE }
 
-/** Feed `chars` per second for `durationMs`, in 100 ms deltas. */
+/** Feed `chars` per second for `durationMs`, in 100 ms deltas from `source`. */
 function stream(
   meter: Meter,
   start: number,
   durationMs: number,
   charsPerSecond: number,
   opts: RateOptions = OPTS,
+  source: DeltaSource = "text",
 ): number {
   let now = start
   for (let elapsed = 0; elapsed < durationMs; elapsed += 100) {
     now = start + elapsed + 100
-    observe(meter, now, charsPerSecond / 10, undefined, opts)
+    observe(meter, now, charsPerSecond / 10, undefined, opts, undefined, source)
   }
   return now
 }
@@ -55,6 +58,28 @@ describe("sliding rate", () => {
     const rate = liveRate(meter, now)
     expect(rate).toBeDefined()
     expect(Math.abs(rate! - 25)).toBeLessThan(1.5)
+  })
+
+  test("converts reasoning and tool input at their own class ratios", () => {
+    const meter = createMeter()
+    meter.outputCharsPerToken = 4
+    meter.reasoningCharsPerToken = 8
+    const now = stream(meter, T0, 4_000, 100)
+    expect(Math.abs(liveRate(meter, now)! - 25)).toBeLessThan(1.5)
+
+    const reasoning = createMeter()
+    reasoning.outputCharsPerToken = 4
+    reasoning.reasoningCharsPerToken = 8
+    const reasoned = stream(reasoning, T0, 4_000, 100, OPTS, "reasoning")
+    // 100 reasoning chars/s at 8 chars/token: half the text figure.
+    expect(Math.abs(liveRate(reasoning, reasoned)! - 12.5)).toBeLessThan(1)
+
+    const tool = createMeter()
+    tool.outputCharsPerToken = 4
+    tool.reasoningCharsPerToken = 8
+    const invoked = stream(tool, T0, 4_000, 100, OPTS, "tool")
+    // Tool input is visible output: the output ratio, not the reasoning one.
+    expect(Math.abs(liveRate(tool, invoked)! - 25)).toBeLessThan(1.5)
   })
 
   test("goes quiet once the window is empty", () => {
@@ -208,7 +233,7 @@ describe("cumulative rate", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 2_000, 200) // 400 chars, first token T0+1100
-    endStep(meter, "a", 160, T0 + 3_100, T0 + 3_100) // 1.9 s of observed decode gaps
+    endStep(meter, "a", { output: 160 }, T0 + 3_100, T0 + 3_100) // 1.9 s of observed decode gaps
     beginStep(meter, "b", T0 + 3_200, T0 + 3_200)
     stream(meter, T0 + 3_300, 1_000, 200) // 200 chars, first token T0+3400
     // (160 exact + 200/3.55 estimated) / (1900 ms exact + the 900 ms
@@ -221,11 +246,25 @@ describe("cumulative rate", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
     beginStep(meter, "b", T0 + 2_200, T0 + 2_200) // tool step: no deltas arrive
     // The silent step adds no decode time, so the turn's ~111 tok/s holds
     // instead of decaying as the tool's clock runs.
     expect(cumulativeRate(meter, T0 + 3_200, OPTS)).toBeCloseTo(111.1, 1)
+  })
+
+  test("converts each class at its own ratio, tool input as output", () => {
+    const meter = createMeter()
+    meter.outputCharsPerToken = 2
+    meter.reasoningCharsPerToken = 8
+    beginStep(meter, "msg", T0, T0)
+    observe(meter, T0, 200, T0, OPTS, "msg") // 200 / 2 = 100 tokens
+    observe(meter, T0 + 1_000, 80, T0 + 1_000, OPTS, "msg", "reasoning") // 80 / 8 = 10
+    observe(meter, T0 + 2_000, 200, T0 + 2_000, OPTS, "msg", "tool") // tool input: 200 / 2 = 100
+    // 210 estimated tokens over the 2 s the decode clock spans.
+    expect(cumulativeRate(meter, T0 + 2_000)).toBeCloseTo(105, 5)
+    expect(meter.step?.outputChars).toBe(400)
+    expect(meter.step?.reasoningChars).toBe(80)
   })
 
   test("stays silent without a step in flight", () => {
@@ -296,7 +335,7 @@ describe("delta attribution", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
     observe(meter, T0 + 100, 40, T0 + 100, OPTS, "other")
-    expect(meter.step?.chars).toBe(0)
+    expect(meter.step?.outputChars).toBe(0)
     expect(meter.step?.decodeMs).toBeUndefined()
     expect(meter.step?.tokenAt).toBeUndefined()
     expect(meter.samples).toEqual([])
@@ -308,7 +347,7 @@ describe("delta attribution", () => {
     beginStep(meter, "msg", T0, T0)
     observe(meter, T0 + 100, 40, T0 + 100, OPTS, "msg")
     observe(meter, T0 + 200, 40, T0 + 200, OPTS, "msg")
-    expect(meter.step?.chars).toBe(80)
+    expect(meter.step?.outputChars).toBe(80)
     expect(meter.step?.decodeMs).toBe(100)
     expect(meter.step?.tokenAt).toBe(T0 + 100)
     expect(meter.samples).toHaveLength(2)
@@ -318,15 +357,15 @@ describe("delta attribution", () => {
     const meter = createMeter()
     beginStep(meter, "a", T0, T0)
     stream(meter, T0, 1_000, 400) // step a's output, unattributed
-    endStep(meter, "a", 100, T0 + 1_100, T0 + 1_100)
+    endStep(meter, "a", { output: 100 }, T0 + 1_100, T0 + 1_100)
     beginStep(meter, "b", T0 + 2_000, T0 + 2_000)
     // Step a's last delta arrives late, after b opened.
     observe(meter, T0 + 2_100, 40, T0 + 2_100, OPTS, "a")
-    expect(meter.step?.chars).toBe(0)
+    expect(meter.step?.outputChars).toBe(0)
     expect(meter.step?.tokenAt).toBeUndefined()
     expect(meter.lastDeltaAt).toBe(T0 + 1_000)
     observe(meter, T0 + 2_200, 40, T0 + 2_200, OPTS, "b")
-    expect(meter.step?.chars).toBe(40)
+    expect(meter.step?.outputChars).toBe(40)
     expect(meter.lastDeltaAt).toBe(T0 + 2_200)
   })
 
@@ -346,10 +385,80 @@ describe("step settlement", () => {
     // 160 tokens over the 1.9 s of observed decode gaps; the previous delta's
     // 100 ms tail is not charged, so the decode clock is preferred over the
     // 2 s ended span.
-    const tps = endStep(meter, "msg", 160, T0 + 3_100, T0 + 3_100)
+    const tps = endStep(meter, "msg", { output: 160 }, T0 + 3_100, T0 + 3_100)
     expect(tps).toBeCloseTo(84.2, 1)
     // 400 chars / 160 tokens = 2.5; EMA from 4 → 3.55.
-    expect(meter.charsPerToken).toBeCloseTo(3.55, 5)
+    expect(meter.outputCharsPerToken).toBeCloseTo(3.55, 5)
+  })
+
+  test("calibrates the output and reasoning ratios separately from the split", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    // 300 visible output chars over 100 exact output tokens: ratio 3.0.
+    for (let index = 0; index < 10; index++) {
+      observe(meter, T0 + 100 + index * 100, 30, T0 + 100 + index * 100, OPTS, "msg")
+    }
+    // 150 reasoning chars over 30 exact reasoning tokens: ratio 5.0.
+    for (let index = 0; index < 10; index++) {
+      observe(meter, T0 + 1_200 + index * 100, 15, T0 + 1_200 + index * 100, OPTS, "msg", "reasoning")
+    }
+    endStep(meter, "msg", { output: 100, reasoning: 30 }, T0 + 2_300, T0 + 2_300)
+    // Each class learns its own ratio: output 4 → 3.7, reasoning 4 → 4.3.
+    expect(meter.outputCharsPerToken).toBeCloseTo(3.7, 5)
+    expect(meter.reasoningCharsPerToken).toBeCloseTo(4.3, 5)
+  })
+
+  test("accumulates small steps into one calibration update", () => {
+    const meter = createMeter()
+    const settle = (index: number) => {
+      const at = T0 + index * 1_000
+      beginStep(meter, `s${index}`, at, at)
+      for (let delta = 0; delta < 3; delta++) observe(meter, at + 100 + delta * 100, 5)
+      endStep(meter, `s${index}`, { output: 5 }, at + 500, at + 500)
+    }
+    settle(0)
+    expect(meter.outputCharsPerToken).toBe(4) // 15 chars: below the floor
+    settle(1)
+    expect(meter.outputCharsPerToken).toBe(4) // 30 chars: still below
+    settle(2)
+    // 45 accumulated chars over 15 tokens = 3.0; EMA from 4 → 3.7.
+    expect(meter.outputCharsPerToken).toBeCloseTo(3.7, 5)
+    // The evidence resets: the next small step does not re-teach at once.
+    settle(3)
+    expect(meter.outputCharsPerToken).toBeCloseTo(3.7, 5)
+  })
+
+  test("a class's evidence only teaches its own ratio", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    for (let index = 0; index < 4; index++) {
+      observe(meter, T0 + 100 + index * 100, 25, undefined, OPTS, "msg", "reasoning")
+    }
+    endStep(meter, "msg", { reasoning: 20 }, T0 + 600, T0 + 600)
+    // 100 reasoning chars / 20 tokens = 5.0; the output ratio stays seeded.
+    expect(meter.reasoningCharsPerToken).toBeCloseTo(4.3, 5)
+    expect(meter.outputCharsPerToken).toBe(4)
+  })
+
+  test("a class's accumulated ratio outside the bounds is discarded", () => {
+    const low = createMeter()
+    beginStep(low, "msg", T0, T0)
+    for (let index = 0; index < 4; index++) observe(low, T0 + 100 + index * 100, 25)
+    endStep(low, "msg", { output: 100 }, T0 + 600, T0 + 600) // 1.0 char/token
+    expect(low.outputCharsPerToken).toBe(4)
+
+    const high = createMeter()
+    beginStep(high, "msg", T0, T0)
+    for (let index = 0; index < 4; index++) observe(high, T0 + 100 + index * 100, 100)
+    endStep(high, "msg", { output: 50 }, T0 + 600, T0 + 600) // 8.0 chars/token
+    expect(high.outputCharsPerToken).toBe(4)
+  })
+
+  test("the configured seed boots both ratios", () => {
+    const opts: RateOptions = { ...DEFAULT_RATE, charsPerToken: 5.5 }
+    const meter = createMeter(opts)
+    expect(meter.outputCharsPerToken).toBe(5.5)
+    expect(meter.reasoningCharsPerToken).toBe(5.5)
   })
 
   test("the exact span starts at the first token, not the step", () => {
@@ -358,13 +467,13 @@ describe("step settlement", () => {
     stream(meter, T0 + 5_000, 1_000, 100) // 5 s before the first token, then 100 chars/s
     // The decode clock starts at T0+5100: 100 tokens over the 0.9 s between
     // the deltas, not the 6.1 s since the step began.
-    expect(endStep(meter, "msg", 100, T0 + 6_100, T0 + 6_100)).toBeCloseTo(111.1, 1)
+    expect(endStep(meter, "msg", { output: 100 }, T0 + 6_100, T0 + 6_100)).toBeCloseTo(111.1, 1)
   })
 
   test("falls back to arrival times when the event clock is unusable", () => {
     const meter = createMeter()
     beginStep(meter, "msg", 0, T0)
-    expect(endStep(meter, "msg", 100, 0, T0 + 2_000)).toBeCloseTo(50, 5)
+    expect(endStep(meter, "msg", { output: 100 }, 0, T0 + 2_000)).toBeCloseTo(50, 5)
   })
 
   test("settles a tiny step instead of discarding it", () => {
@@ -372,7 +481,7 @@ describe("step settlement", () => {
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0, 100, 40) // first token T0+100
     // 5 tokens over 83 ms: a two-word answer is still a measurement.
-    expect(endStep(meter, "msg", 5, T0 + 183, T0 + 183)).toBeCloseTo(60.24, 1)
+    expect(endStep(meter, "msg", { output: 5 }, T0 + 183, T0 + 183)).toBeCloseTo(60.24, 1)
     expect(meter.final?.kind).toBe("turn")
   })
 
@@ -382,7 +491,7 @@ describe("step settlement", () => {
     beginStep(meter, "msg", T0, T0)
     // A 10 ms span is below the floor: the duration is clamped to the floor
     // and the exact tokens still fold, rather than the step being discarded.
-    expect(endStep(meter, "msg", 100, T0 + 10, T0 + 10)).toBeCloseTo(2_000, 5)
+    expect(endStep(meter, "msg", { output: 100 }, T0 + 10, T0 + 10)).toBeCloseTo(2_000, 5)
     expect(meter.turn).toEqual({ tokens: 100, ms: 50 })
     expect(meter.final?.kind).toBe("turn")
   })
@@ -393,15 +502,15 @@ describe("step settlement", () => {
     beginStep(meter, "msg", T0, T0)
     // The ended span is beyond the ceiling and the arrival span is zero: no
     // candidate is usable, so the event clock is clamped and the tokens fold.
-    expect(endStep(meter, "msg", 100, T0 + 7_200_000, T0)).toBeCloseTo(100 / 3_600, 5)
+    expect(endStep(meter, "msg", { output: 100 }, T0 + 7_200_000, T0)).toBeCloseTo(100 / 3_600, 5)
     expect(meter.turn).toEqual({ tokens: 100, ms: 3_600_000 })
   })
 
   test("ignores a missing step or a step with no tokens", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
-    expect(endStep(meter, "other", 100, T0 + 2_000, T0)).toBeUndefined() // never started
-    expect(endStep(meter, "msg", 0, T0 + 2_000, T0 + 2_000)).toBeUndefined() // no exact tokens
+    expect(endStep(meter, "other", { output: 100 }, T0 + 2_000, T0)).toBeUndefined() // never started
+    expect(endStep(meter, "msg", {}, T0 + 2_000, T0 + 2_000)).toBeUndefined() // no exact tokens
     expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
     expect(meter.final).toBeUndefined()
   })
@@ -413,7 +522,7 @@ describe("step failure", () => {
     beginTurn(meter, T0)
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0 + 1_000, 2_000, 200) // 400 chars, first token T0+1100, decode 1.9 s
-    expect(failStep(meter, "msg", 160, T0 + 3_100, T0 + 3_100)).toBeCloseTo(84.2, 1)
+    expect(failStep(meter, "msg", { output: 160 }, T0 + 3_100, T0 + 3_100)).toBeCloseTo(84.2, 1)
     expect(meter.step).toBeUndefined()
     expect(meter.turn).toEqual({ tokens: 160, ms: 1_900 })
     expect(meter.final?.kind).toBe("turn")
@@ -425,7 +534,7 @@ describe("step failure", () => {
     beginTurn(meter, T0)
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    expect(failStep(meter, "msg", 0, T0 + 2_100, T0 + 2_100)).toBeUndefined()
+    expect(failStep(meter, "msg", {}, T0 + 2_100, T0 + 2_100)).toBeUndefined()
     expect(meter.step).toBeUndefined()
     expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
     expect(meter.final).toBeUndefined()
@@ -437,10 +546,23 @@ describe("step failure", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0, 1_000, 400)
-    expect(failStep(meter, "other", 100, T0 + 2_000, T0 + 2_000)).toBeUndefined()
+    expect(failStep(meter, "other", { output: 100 }, T0 + 2_000, T0 + 2_000)).toBeUndefined()
     expect(meter.step?.assistantMessageID).toBe("msg")
-    expect(meter.step?.chars).toBe(400)
+    expect(meter.step?.outputChars).toBe(400)
     expect(meter.turn).toEqual({ tokens: 0, ms: 0 })
+  })
+
+  test("a failed step teaches each class ratio from the split it reports", () => {
+    const meter = createMeter()
+    beginStep(meter, "msg", T0, T0)
+    stream(meter, T0, 2_000, 150) // 300 output chars
+    for (let index = 0; index < 5; index++) {
+      observe(meter, T0 + 2_100 + index * 100, 20, undefined, OPTS, "msg", "reasoning")
+    }
+    failStep(meter, "msg", { output: 100, reasoning: 30 }, T0 + 3_100, T0 + 3_100)
+    // Output 300/100 = 3.0 → 3.7; reasoning 100/30 ≈ 3.33 → 3.8.
+    expect(meter.outputCharsPerToken).toBeCloseTo(3.7, 5)
+    expect(meter.reasoningCharsPerToken).toBeCloseTo(3.8, 5)
   })
 })
 
@@ -457,7 +579,7 @@ describe("step retry", () => {
     // The provider retries in place: the same assistant message starts again.
     beginStep(meter, "msg", stop + 4_000, stop + 4_000)
     expect(meter.step).toBe(open)
-    expect(meter.step?.chars).toBe(400)
+    expect(meter.step?.outputChars).toBe(400)
     expect(meter.step?.decodeMs).toBe(900)
     expect(meter.step?.tokenAt).toBe(T0 + 1_100)
     expect(meter.step?.tokenArrivedAt).toBe(T0 + 1_100)
@@ -467,7 +589,7 @@ describe("step retry", () => {
     // ...and the retry's output continues it; the backoff is not charged
     // beyond the gap ceiling.
     observe(meter, stop + 4_100, 40, stop + 4_100, OPTS, "msg")
-    expect(meter.step?.chars).toBe(440)
+    expect(meter.step?.outputChars).toBe(440)
     expect(meter.step?.decodeMs).toBe(3_900)
   })
 
@@ -476,7 +598,7 @@ describe("step retry", () => {
     beginStep(meter, "a", T0, T0)
     stream(meter, T0, 1_000, 400)
     beginStep(meter, "b", T0 + 2_000, T0 + 2_000)
-    expect(meter.step).toEqual({ assistantMessageID: "b", chars: 0, at: T0 + 2_000, arrivedAt: T0 + 2_000 })
+    expect(meter.step).toEqual({ assistantMessageID: "b", outputChars: 0, reasoningChars: 0, at: T0 + 2_000, arrivedAt: T0 + 2_000 })
     expect(cumulativeRate(meter, T0 + 2_000)).toBeUndefined()
   })
 })
@@ -488,7 +610,7 @@ describe("settled span", () => {
     const stop = stream(meter, T0, 2_000, 200) // first token T0+100, decode clock 1.9 s
     // A shell runs for a minute before the step settles: its runtime belongs to
     // the tool, not to the model, so the settled figure matches the decode.
-    const tps = endStep(meter, "msg", 200, stop + 60_000, stop + 60_000)
+    const tps = endStep(meter, "msg", { output: 200 }, stop + 60_000, stop + 60_000)
     expect(tps).toBeCloseTo(200 / 1.9, 5)
     expect(meter.turn).toEqual({ tokens: 200, ms: 1_900 })
   })
@@ -498,7 +620,7 @@ describe("settled span", () => {
     beginStep(meter, "msg", T0, T0)
     const stop = stream(meter, T0, 2_000, 200) // decode clock: 1.9 s
     recordStreamed(meter, "msg", T0 + 4_000) // boundary span: 3.9 s
-    expect(endStep(meter, "msg", 200, stop + 60_000, stop + 60_000)).toBeCloseTo(200 / 1.9, 5)
+    expect(endStep(meter, "msg", { output: 200 }, stop + 60_000, stop + 60_000)).toBeCloseTo(200 / 1.9, 5)
   })
 
   test("a step met mid-stream does not prefer its partial decode clock", () => {
@@ -507,7 +629,8 @@ describe("settled span", () => {
     // the deltas before this process started were never observed.
     meter.step = {
       assistantMessageID: "msg",
-      chars: 2_000,
+      outputChars: 2_000,
+      reasoningChars: 0,
       at: T0,
       arrivedAt: T0,
       tokenAt: T0 + 10_000,
@@ -518,7 +641,7 @@ describe("settled span", () => {
     recordStreamed(meter, "msg", T0 + 50_000)
     // 400 tokens over the stream boundary's 40 s, not the 100 ms clock the
     // later deltas alone accumulated.
-    expect(endStep(meter, "msg", 400, T0 + 90_000, T0 + 90_000)).toBeCloseTo(10, 5)
+    expect(endStep(meter, "msg", { output: 400 }, T0 + 90_000, T0 + 90_000)).toBeCloseTo(10, 5)
     expect(meter.turn).toEqual({ tokens: 400, ms: 40_000 })
   })
 
@@ -528,7 +651,8 @@ describe("settled span", () => {
     // record, but its deltas were never observed.
     meter.step = {
       assistantMessageID: "msg",
-      chars: 400,
+      outputChars: 400,
+      reasoningChars: 0,
       at: T0,
       arrivedAt: T0,
       tokenAt: T0 + 1_000,
@@ -536,7 +660,7 @@ describe("settled span", () => {
     }
     recordStreamed(meter, "msg", T0 + 6_000)
     // The ended event trails a half-minute tool; the stream boundary does not.
-    expect(endStep(meter, "msg", 200, T0 + 36_000, T0 + 36_000)).toBeCloseTo(40, 5)
+    expect(endStep(meter, "msg", { output: 200 }, T0 + 36_000, T0 + 36_000)).toBeCloseTo(40, 5)
     expect(meter.turn).toEqual({ tokens: 200, ms: 5_000 })
   })
 
@@ -547,14 +671,14 @@ describe("settled span", () => {
     recordStreamed(meter, "msg", T0 + 3_000)
     // The ended span trails a tool by a minute; the boundary gives the 2 s
     // decode span the observed single delta cannot.
-    expect(endStep(meter, "msg", 10, T0 + 63_000, T0 + 63_000)).toBeCloseTo(5, 5)
+    expect(endStep(meter, "msg", { output: 10 }, T0 + 63_000, T0 + 63_000)).toBeCloseTo(5, 5)
   })
 
   test("falls past an unusable stream boundary to the ended span", () => {
     const meter = createMeter()
     beginStep(meter, "msg", T0, T0)
     recordStreamed(meter, "msg", T0 + 10) // before the step even started: nonsense
-    expect(endStep(meter, "msg", 100, T0 + 2_000, T0 + 2_000)).toBeCloseTo(50, 5)
+    expect(endStep(meter, "msg", { output: 100 }, T0 + 2_000, T0 + 2_000)).toBeCloseTo(50, 5)
   })
 
   test("ignores a boundary for another step or with none open", () => {
@@ -575,10 +699,10 @@ describe("turn fold", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
     beginStep(meter, "b", T0 + 2_200, T0 + 2_200)
     stream(meter, T0 + 2_300, 1_000, 400)
-    endStep(meter, "b", 200, T0 + 3_400, T0 + 3_400) // 200 tokens in 0.9 s
+    endStep(meter, "b", { output: 200 }, T0 + 3_400, T0 + 3_400) // 200 tokens in 0.9 s
 
     // 300 tokens over the 1.8 s of observed decode time, not the last step's 222.
     expect(meter.final?.tps).toBeCloseTo(166.7, 1)
@@ -598,7 +722,7 @@ describe("turn fold", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400, opts)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100, opts)
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100, opts)
     expect(meter.final?.kind).toBe("step")
     endTurn(meter, T0 + 2_200, opts)
     expect(meter.history[0]!.tps).toBeCloseTo(111.1, 1)
@@ -611,7 +735,7 @@ describe("turn fold", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100)
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100)
     endTurn(meter, T0 + 2_200)
     endTurn(meter, T0 + 2_300)
     expect(meter.history).toHaveLength(1)
@@ -622,7 +746,7 @@ describe("turn fold", () => {
     beginTurn(meter, T0)
     beginStep(meter, "a", T0, T0)
     stream(meter, T0 + 1_000, 1_000, 400)
-    endStep(meter, "a", 100, T0 + 2_100, T0 + 2_100)
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100)
     // No endTurn arrived: the turn simply never reported its end.
     expect(meter.history).toHaveLength(0)
     beginTurn(meter, T0 + 5_000)
@@ -639,7 +763,7 @@ describe("turn fold", () => {
       beginTurn(meter, T0 + index * 1_000)
       beginStep(meter, `s${index}`, T0 + index * 1_000, T0 + index * 1_000)
       stream(meter, T0 + index * 1_000 + 100, 1_000, 400, opts)
-      endStep(meter, `s${index}`, 100, T0 + index * 1_000 + 1_200, T0 + index * 1_000 + 1_200, opts)
+      endStep(meter, `s${index}`, { output: 100 }, T0 + index * 1_000 + 1_200, T0 + index * 1_000 + 1_200, opts)
       endTurn(meter, T0 + index * 1_000 + 1_300, opts)
     }
     expect(meter.history).toHaveLength(2)
@@ -850,7 +974,7 @@ describe("display", () => {
     beginStep(meter, "msg", T0, T0)
     const now = stream(meter, T0, 1_000, 400)
     expect(liveRate(meter, now)).toBeDefined() // a last live figure exists to forget
-    endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100) // 100 tokens in 1 s
+    endStep(meter, "msg", { output: 100 }, T0 + 1_100, T0 + 1_100) // 100 tokens in 1 s
     const later = T0 + 1_100 + WINDOW + 100
 
     const settled = display(meter, later, ["sliding", "cumulative"])
@@ -879,7 +1003,7 @@ describe("display", () => {
     const now = stream(meter, T0, 1_000, 400, opts)
     const held = liveRate(meter, now, opts)! // the last live sliding figure
     expect(held).toBeDefined()
-    endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100, opts) // 100 tokens in 1 s
+    endStep(meter, "msg", { output: 100 }, T0 + 1_100, T0 + 1_100, opts) // 100 tokens in 1 s
     const later = T0 + 1_100 + WINDOW + 100
 
     const settled = display(meter, later, ["sliding", "cumulative"], opts)
@@ -897,7 +1021,7 @@ describe("display", () => {
     const meter = createMeter(opts)
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0, 1_000, 400, opts)
-    endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100, opts)
+    endStep(meter, "msg", { output: 100 }, T0 + 1_100, T0 + 1_100, opts)
     const settled = display(meter, T0 + 1_100 + WINDOW + 100, [], opts, USAGE_LABELS.icons)
     expect(settled?.readings.map((reading) => reading.label)).toEqual(["✓"])
   })
@@ -908,7 +1032,7 @@ describe("display", () => {
     beginTurn(meter, T0)
     beginStep(meter, "msg", T0, T0)
     const now = stream(meter, T0, 1_000, 400, opts)
-    endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100, opts)
+    endStep(meter, "msg", { output: 100 }, T0 + 1_100, T0 + 1_100, opts)
     const settled = display(meter, now + WINDOW + 100, ["sliding", "cumulative"], opts)
     expect(settled?.readings.map((reading) => reading.key)).toEqual(["cumulative"])
     expect(settled?.readings[0]!.live).toBe(false)
@@ -929,7 +1053,7 @@ describe("display", () => {
     beginTurn(meter, T0)
     beginStep(meter, "msg", T0, T0)
     stream(meter, T0, 1_000, 400)
-    endStep(meter, "msg", 100, T0 + 1_100, T0 + 1_100)
+    endStep(meter, "msg", { output: 100 }, T0 + 1_100, T0 + 1_100)
     const later = T0 + 1_100 + WINDOW + 100
 
     beginTurn(meter, T0)
@@ -940,6 +1064,49 @@ describe("display", () => {
     beginStep(meter, "next", later + 20, later + 20)
     const streaming = stream(meter, later + 1_000, 1_500, 400)
     expect(display(meter, streaming, ["sliding", "cumulative"])?.live).toBe(true)
+  })
+})
+
+describe("meter adoption", () => {
+  test("brings a pre-split meter forward without losing its figures", () => {
+    const legacy = {
+      samples: [
+        { at: T0, chars: 40 },
+        { at: T0 + 100, chars: 40 },
+      ],
+      lastDeltaAt: T0 + 100,
+      turn: { tokens: 100, ms: 900 },
+      charsPerToken: 3,
+      final: { tps: 111, at: T0 + 200, kind: "step", tokens: 100, ms: 900 },
+      history: [],
+      step: { assistantMessageID: "msg", chars: 20, at: T0, arrivedAt: T0 },
+    } as unknown as Meter
+    adoptMeter(legacy)
+    // The old ratio seeds both classes; old counts all count as output.
+    expect(legacy.outputCharsPerToken).toBe(3)
+    expect(legacy.reasoningCharsPerToken).toBe(3)
+    expect(legacy.evidence).toEqual({ output: { chars: 0, tokens: 0 }, reasoning: { chars: 0, tokens: 0 } })
+    expect(legacy.samples).toEqual([
+      { at: T0, outputChars: 40, reasoningChars: 0 },
+      { at: T0 + 100, outputChars: 40, reasoningChars: 0 },
+    ])
+    expect(legacy.step?.outputChars).toBe(20)
+    expect(legacy.step?.reasoningChars).toBe(0)
+    // The adopted window converts again instead of reading NaN.
+    expect(liveRate(legacy, T0 + 200)).toBeDefined()
+  })
+
+  test("leaves a current meter untouched", () => {
+    const meter = createMeter()
+    meter.outputCharsPerToken = 3.2
+    meter.reasoningCharsPerToken = 4.8
+    meter.evidence.output = { chars: 12, tokens: 3 }
+    meter.samples.push({ at: T0, outputChars: 10, reasoningChars: 5 })
+    adoptMeter(meter)
+    expect(meter.outputCharsPerToken).toBe(3.2)
+    expect(meter.reasoningCharsPerToken).toBe(4.8)
+    expect(meter.evidence.output).toEqual({ chars: 12, tokens: 3 })
+    expect(meter.samples).toEqual([{ at: T0, outputChars: 10, reasoningChars: 5 }])
   })
 })
 
@@ -1024,14 +1191,14 @@ describe("statistics", () => {
       beginTurn(meter, at)
       beginStep(meter, `tiny${index}`, at, at)
       stream(meter, at + 100, 200, 400) // two deltas, one 100 ms decode gap
-      endStep(meter, `tiny${index}`, 10, at + 400, at + 400)
+      endStep(meter, `tiny${index}`, { output: 10 }, at + 400, at + 400)
       endTurn(meter, at + 500)
     }
     const slowAt = T0 + 40_000
     beginTurn(meter, slowAt)
     beginStep(meter, "slow", slowAt, slowAt)
     stream(meter, slowAt + 100, 9_800, 40) // 97 decode gaps of 100 ms
-    endStep(meter, "slow", 100, slowAt + 10_000, slowAt + 10_000)
+    endStep(meter, "slow", { output: 100 }, slowAt + 10_000, slowAt + 10_000)
     endTurn(meter, slowAt + 10_300)
 
     // 130 tokens over 10 s of decode time, not the ~78 the four per-turn

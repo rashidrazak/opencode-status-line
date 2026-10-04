@@ -400,13 +400,17 @@ wears `✓`.
 
 ### Characters per token
 
-The plugin converts streamed characters into tokens using a ratio. It starts at
-4 characters per token and learns from each finished step.
+The plugin converts streamed characters into tokens using two ratios — one for
+visible output (text and tool input), one for reasoning — and starts both at 4
+characters per token. Each finished step reports its exact output and reasoning
+token counts, so each class's ratio learns from its own split. Small steps
+count: a ratio updates once its class has accumulated enough text, even when no
+single step has.
 
 | Key | Default | Allowed | What it does |
 | --- | --- | --- | --- |
-| `calibration.enabled` | `true` | true/false | Let finished steps adjust the ratio |
-| `calibration.charsPerToken` | `4` | 0.5–50 | Starting guess, used until calibration has data |
+| `calibration.enabled` | `true` | true/false | Let finished steps adjust the ratios |
+| `calibration.charsPerToken` | `4` | 0.5–50 | Starting guess for both ratios, used until calibration has data |
 | `calibration.min` | `2.5` | 0.5–50 | Guesses below this are thrown away |
 | `calibration.max` | `7` | 0.5–50 | Guesses above this are thrown away |
 

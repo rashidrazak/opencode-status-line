@@ -10,7 +10,10 @@
  * counts when a step settles — ends or fails — so the live figures are
  * estimated from streamed output (`session.text.delta`,
  * `session.reasoning.delta`, `session.tool.input.delta`) and calibrated
- * against the exact counts on `session.step.ended` and `session.step.failed`:
+ * against the exact counts on `session.step.ended` and `session.step.failed`.
+ * Reasoning and visible output keep separate characters-per-token ratios,
+ * tool input counting as output; small steps accumulate until they teach
+ * together:
  *
  *   sliding     ↯  what the last few seconds look like, right now
  *   cumulative  μ  the average since the turn began (exact tokens from every
@@ -42,9 +45,10 @@ import { contextBarWidth, loadConfig, rateOptions, resolvedPadding, segmentsFor,
 import { diffDue, diffKey, diffParts, diffTotals, type DiffReading, type DiffStat, type StatusFile } from "./diff.ts"
 import { createGuard } from "./guard.ts"
 import { HOST_PALETTE, inkColor, resolvePalette } from "./palette.ts"
-import type { Display, Meter } from "./rate.ts"
+import type { DeltaSource, Display, Meter } from "./rate.ts"
 import {
   active,
+  adoptMeter,
   beginStep,
   beginTurn,
   createMeter,
@@ -144,6 +148,10 @@ export default Plugin.define({
     }
 
     const meters = sharedMeters()
+    // A hot reload can hand this generation meters saved before the class
+    // ratios existed; adopt them rather than reading NaN estimates until the
+    // stream restarts.
+    for (const each of meters.values()) adoptMeter(each)
     const [version, setVersion] = createSignal(0, { equals: false })
     let timer: ReturnType<typeof setInterval> | undefined
     /** Keeps the elapsed timer and held figures repainting while nothing streams. */
@@ -225,16 +233,27 @@ export default Plugin.define({
           if (message?.type === "assistant" && message.time?.completed === undefined) streaming = message
         }
         if (streaming?.id) {
-          let chars = 0
+          let outputChars = 0
+          let reasoningChars = 0
           for (const part of streaming.content ?? []) {
-            if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") chars += part.text.length
+            if (typeof part.text !== "string") continue
+            if (part.type === "text") outputChars += part.text.length
+            else if (part.type === "reasoning") reasoningChars += part.text.length
           }
           // The first reasoning timestamp is the closest thing to the first
           // token the record keeps; `time.streamed` is the stream boundary,
           // an end stamp, not a start.
           const at = firstTokenAt(streaming) ?? streaming.time?.created ?? Date.now()
           const each = meter(sessionID)
-          each.step = { assistantMessageID: streaming.id, chars, at, arrivedAt: Date.now(), tokenAt: at, tokenArrivedAt: Date.now() }
+          each.step = {
+            assistantMessageID: streaming.id,
+            outputChars,
+            reasoningChars,
+            at,
+            arrivedAt: Date.now(),
+            tokenAt: at,
+            tokenArrivedAt: Date.now(),
+          }
           bump()
           return
         }
@@ -255,7 +274,7 @@ export default Plugin.define({
     const startup = context.ui.router.current()
     if (startup.type === "session") void seedMeter(startup.sessionID)
 
-    const onDelta = (event: Event) => {
+    const onDelta = (source: DeltaSource) => (event: Event) => {
       const data = event?.data
       if (!data || typeof data.sessionID !== "string") return
       const { delta } = data
@@ -263,8 +282,9 @@ export default Plugin.define({
       // The event's own clock marks the first token, so the exact figure's span
       // starts when the model actually began emitting. The message ID
       // attributes the delta: a straggler from an earlier step must not be
-      // charged to the step now streaming.
-      observe(meter(data.sessionID), Date.now(), delta.length, event.created, opts, data.assistantMessageID)
+      // charged to the step now streaming. The source keeps reasoning and
+      // visible output on their own calibrated ratios.
+      observe(meter(data.sessionID), Date.now(), delta.length, event.created, opts, data.assistantMessageID, source)
       tick()
     }
 
@@ -297,11 +317,12 @@ export default Plugin.define({
     }
 
     const stops = [
-      context.data.on("session.text.delta", safely(onDelta)),
-      context.data.on("session.reasoning.delta", safely(onDelta)),
-      // Tool arguments stream as output tokens too; counting them keeps the
-      // meter honest while a large file or command is being written.
-      context.data.on("session.tool.input.delta", safely(onDelta)),
+      context.data.on("session.text.delta", safely(onDelta("text"))),
+      context.data.on("session.reasoning.delta", safely(onDelta("reasoning"))),
+      // Tool arguments stream as visible output tokens too; they count in the
+      // output class, the host's own split, so a large file or command being
+      // written keeps the meter honest without teaching the reasoning ratio.
+      context.data.on("session.tool.input.delta", safely(onDelta("tool"))),
       context.data.on(
         "session.step.started",
         safely((event: Event) => {
@@ -333,9 +354,8 @@ export default Plugin.define({
           const data = event?.data
           const tokens = data?.tokens
           if (typeof data?.sessionID !== "string" || typeof data?.assistantMessageID !== "string" || !tokens) return
-          const output = (tokens.output ?? 0) + (tokens.reasoning ?? 0)
           const endedAt = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
-          endStep(meter(data.sessionID), data.assistantMessageID, output, endedAt, Date.now(), opts)
+          endStep(meter(data.sessionID), data.assistantMessageID, tokens, endedAt, Date.now(), opts)
           bump()
         }),
       ),
@@ -348,10 +368,9 @@ export default Plugin.define({
           // the event reports fold in, and a failure without them simply
           // clears, so the step does not linger decaying until turn end. The
           // same clock domain as the started and ended stamps.
-          const tokens = data.tokens
-          const output = (tokens?.output ?? 0) + (tokens?.reasoning ?? 0)
+          const tokens = data.tokens ?? {}
           const endedAt = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
-          failStep(meter(data.sessionID), data.assistantMessageID, output, endedAt, Date.now(), opts)
+          failStep(meter(data.sessionID), data.assistantMessageID, tokens, endedAt, Date.now(), opts)
           bump()
         }),
       ),
