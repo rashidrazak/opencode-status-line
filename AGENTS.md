@@ -57,9 +57,13 @@ never touch disk from a test.
 Commits follow Conventional Commits — `<type>(<scope>): <subject>`, imperative,
 lowercase, no trailing period; the types and scopes, plus the pre-PR checklist,
 are in `CONTRIBUTING.md`. One problem per PR; a change to `src/tui.tsx` needs a
-real session to prove it, because no test covers the event wiring, and `main`
-takes pull requests only: green CI plus one approving review (the maintainer
-bypasses for their own work).
+real session to prove it, because no test covers the event wiring.
+
+Direct pushes to `main` are rejected: a repository ruleset requires every change
+to arrive through a pull request with one approving review, resolved review
+threads and green required checks, and blocks force pushes and deletions. So
+push a branch and open the PR against `main` — for docs changes too. The
+maintainer's admin role bypasses the ruleset for their own work.
 
 ## Deep dives — read the matching file before touching that area
 
