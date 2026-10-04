@@ -7,25 +7,33 @@
  * placement through `usage.surfaces`).
  *
  * The speed segment carries two live readings. OpenCode only learns exact token
- * counts when a step finishes, so the live figures are estimated from streamed
- * output (`session.text.delta`, `session.reasoning.delta`,
- * `session.tool.input.delta`) and calibrated against the exact counts on
- * `session.step.ended`:
+ * counts when a step settles — ends or fails — so the live figures are
+ * estimated from streamed output (`session.text.delta`,
+ * `session.reasoning.delta`, `session.tool.input.delta`) and calibrated
+ * against the exact counts on `session.step.ended` and `session.step.failed`.
+ * Reasoning and visible output keep separate characters-per-token ratios,
+ * tool input counting as output; small steps accumulate until they teach
+ * together:
  *
  *   sliding     ↯  what the last few seconds look like, right now
- *   cumulative  μ  the average since the turn began (exact tokens from every
- *                  finished step of the turn plus the step in flight)
+ *   cumulative  μ  the average since the turn began — exact tokens from every
+ *                  finished step of the turn plus the step in flight; a queued
+ *                  prompt starts its own turn, a steer stays in the current one
  *
- * The settled figure folds the whole turn (configurable) and the sliding
- * reading holds its last value once a stream stops (`window.hold`), so the line
- * never loses its last figure at the finish line. A session met without a meter
- * (a resume, a plugin reload) has its settled figure rebuilt from the last
- * turn's recorded messages, so the meter segment does not come back blank — it
- * shows the settled average over a resting `↯ 0.0` and an empty gauge. The
- * sliding window's samples are delta arrival times no record keeps, so a real
- * `↯` figure only returns with the next stream. The gauge stays on screen (it
- * holds the last reading once settled), figures are speed-coloured, and
- * `/opencode-status-line` shows the numbers behind them.
+ * The settled figure measures decode time: its span prefers the observed decode
+ * clock, then the host's stream boundary (`session.step.streamed`, published
+ * before tool settlement), so time a tool spent running is not charged. It
+ * folds the whole turn (configurable) and the sliding reading comes to rest
+ * once a stream stops — `window.hold: true` keeps it at a dimmed `0.0` over an
+ * empty gauge, `false` hides it, `"last"` keeps the last value — so the line
+ * keeps its shape without re-showing a figure nothing is producing. A session
+ * met without a meter (a resume, a plugin reload) has its settled figure
+ * rebuilt from the last turn's recorded messages, so the meter segment does not
+ * come back blank — it shows the settled average over a resting `↯ 0.0` and an
+ * empty gauge. The sliding window's samples are delta arrival times no record
+ * keeps, so a real `↯` figure only returns with the next stream. The gauge
+ * stays on screen while the sliding figure rests, figures are speed-coloured,
+ * and `/opencode-status-line` shows the numbers behind them.
  *
  * Configuration lives in `~/.config/opencode/opencode-status-line.json` and a
  * project's `.opencode-status-line.json` — see config.ts. The plugin lives in
@@ -38,21 +46,27 @@ import { contextBarWidth, loadConfig, rateOptions, resolvedPadding, segmentsFor,
 import { diffDue, diffKey, diffParts, diffTotals, type DiffReading, type DiffStat, type StatusFile } from "./diff.ts"
 import { createGuard } from "./guard.ts"
 import { HOST_PALETTE, inkColor, resolvePalette } from "./palette.ts"
-import type { Display, Meter } from "./rate.ts"
+import type { DeltaSource, Delivery, Display, Meter } from "./rate.ts"
 import {
   active,
+  adoptMeter,
   beginStep,
+  beginToolInput,
   beginTurn,
   createMeter,
+  deliver,
   display,
   endStep,
+  endToolInput,
   endTurn,
+  failStep,
   firstTokenAt,
   formatRate,
   notePeak,
   observe,
   peakTps,
   recordedSteps,
+  recordStreamed,
   restoreFinal,
   speedTone,
   tpsStats,
@@ -84,6 +98,28 @@ const sharedMeters = (): Map<string, Meter> => {
   return meters
 }
 
+/**
+ * The delivery type of every enqueued inbox item, keyed by inbox ID, until it
+ * is delivered or cancelled. Shared across generations like the meters: an
+ * item can be queued before a source save and delivered after, and a lost type
+ * would silently merge the queued prompt into the turn before it — the very
+ * split this bookkeeping exists to make.
+ */
+const DELIVERIES = "__opencodeStatusLineDeliveries"
+
+const sharedDeliveries = (): Map<string, Delivery> => {
+  const shared = globalThis as Record<string, unknown>
+  const existing = shared[DELIVERIES]
+  if (existing instanceof Map) return existing as Map<string, Delivery>
+  const deliveries = new Map<string, Delivery>()
+  shared[DELIVERIES] = deliveries
+  return deliveries
+}
+
+/** The host's delivery string as the known delivery type, when it is one. */
+const asDelivery = (value: string | undefined): Delivery | undefined =>
+  value === "steer" || value === "queue" ? value : undefined
+
 /** The bits of the event payloads this plugin reads. */
 interface Tokens {
   output?: number
@@ -98,6 +134,12 @@ interface Event {
     assistantMessageID?: string
     delta?: string
     tokens?: Tokens
+    /** The inbox item an enqueue names; its `delivery` says how it will run. */
+    item?: { delivery?: string }
+    /** The inbox item an enqueue, delivery, change or cancel names. */
+    inboxID?: string
+    /** The delivery type a change reports. */
+    delivery?: string
   }
 }
 
@@ -138,6 +180,11 @@ export default Plugin.define({
     }
 
     const meters = sharedMeters()
+    const deliveries = sharedDeliveries()
+    // A hot reload can hand this generation meters saved before the class
+    // ratios existed; adopt them rather than reading NaN estimates until the
+    // stream restarts.
+    for (const each of meters.values()) adoptMeter(each)
     const [version, setVersion] = createSignal(0, { equals: false })
     let timer: ReturnType<typeof setInterval> | undefined
     /** Keeps the elapsed timer and held figures repainting while nothing streams. */
@@ -219,16 +266,27 @@ export default Plugin.define({
           if (message?.type === "assistant" && message.time?.completed === undefined) streaming = message
         }
         if (streaming?.id) {
-          let chars = 0
+          let outputChars = 0
+          let reasoningChars = 0
           for (const part of streaming.content ?? []) {
-            if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") chars += part.text.length
+            if (typeof part.text !== "string") continue
+            if (part.type === "text") outputChars += part.text.length
+            else if (part.type === "reasoning") reasoningChars += part.text.length
           }
           // The first reasoning timestamp is the closest thing to the first
-          // token the record keeps; `time.streamed` is a finalisation stamp,
-          // not a start.
+          // token the record keeps; `time.streamed` is the stream boundary,
+          // an end stamp, not a start.
           const at = firstTokenAt(streaming) ?? streaming.time?.created ?? Date.now()
           const each = meter(sessionID)
-          each.step = { assistantMessageID: streaming.id, chars, at, arrivedAt: Date.now(), tokenAt: at, tokenArrivedAt: Date.now() }
+          each.step = {
+            assistantMessageID: streaming.id,
+            outputChars,
+            reasoningChars,
+            at,
+            arrivedAt: Date.now(),
+            tokenAt: at,
+            tokenArrivedAt: Date.now(),
+          }
           bump()
           return
         }
@@ -249,14 +307,17 @@ export default Plugin.define({
     const startup = context.ui.router.current()
     if (startup.type === "session") void seedMeter(startup.sessionID)
 
-    const onDelta = (event: Event) => {
+    const onDelta = (source: DeltaSource) => (event: Event) => {
       const data = event?.data
       if (!data || typeof data.sessionID !== "string") return
       const { delta } = data
       if (typeof delta !== "string" || delta.length === 0) return
       // The event's own clock marks the first token, so the exact figure's span
-      // starts when the model actually began emitting.
-      observe(meter(data.sessionID), Date.now(), delta.length, event.created, opts)
+      // starts when the model actually began emitting. The message ID
+      // attributes the delta: a straggler from an earlier step must not be
+      // charged to the step now streaming. The source keeps reasoning and
+      // visible output on their own calibrated ratios.
+      observe(meter(data.sessionID), Date.now(), delta.length, event.created, opts, data.assistantMessageID, source)
       tick()
     }
 
@@ -289,11 +350,35 @@ export default Plugin.define({
     }
 
     const stops = [
-      context.data.on("session.text.delta", safely(onDelta)),
-      context.data.on("session.reasoning.delta", safely(onDelta)),
-      // Tool arguments stream as output tokens too; counting them keeps the
-      // meter honest while a large file or command is being written.
-      context.data.on("session.tool.input.delta", safely(onDelta)),
+      context.data.on("session.text.delta", safely(onDelta("text"))),
+      context.data.on("session.reasoning.delta", safely(onDelta("reasoning"))),
+      // Tool arguments stream as visible output tokens too; they count in the
+      // output class, the host's own split, so a large file or command being
+      // written keeps the meter honest without teaching the reasoning ratio.
+      context.data.on("session.tool.input.delta", safely(onDelta("tool"))),
+      // A tool call's argument stream. The host publishes the window's
+      // boundaries even when it publishes no per-chunk deltas — this host and
+      // provider stream none — and argument tokens are part of the step's
+      // exact output, so the window is charged to the step's decode clock:
+      // the opening boundary pauses ordinary gap accounting, the closing one
+      // charges the window. Execution starts at `session.tool.called`, after
+      // the closing boundary, so tool runtime still is not charged.
+      context.data.on(
+        "session.tool.input.started",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string") return
+          beginToolInput(meter(data.sessionID), data.assistantMessageID, Date.now())
+        }),
+      ),
+      context.data.on(
+        "session.tool.input.ended",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string") return
+          endToolInput(meter(data.sessionID), data.assistantMessageID, Date.now(), opts)
+        }),
+      ),
       context.data.on(
         "session.step.started",
         safely((event: Event) => {
@@ -306,19 +391,49 @@ export default Plugin.define({
         }),
       ),
       context.data.on(
+        "session.step.streamed",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string" || typeof data?.assistantMessageID !== "string") return
+          // The provider response body ended here, before any tool it called
+          // settled. The host stamps `time.streamed` with the event's own
+          // clock, so only that stamp is comparable with the first-token one;
+          // a missing stamp leaves the step unstamped rather than mixing in a
+          // local clock the settlement span cannot use.
+          if (typeof event.created !== "number" || event.created <= 0) return
+          recordStreamed(meter(data.sessionID), data.assistantMessageID, event.created)
+        }),
+      ),
+      context.data.on(
         "session.step.ended",
         safely((event: Event) => {
           const data = event?.data
           const tokens = data?.tokens
           if (typeof data?.sessionID !== "string" || typeof data?.assistantMessageID !== "string" || !tokens) return
-          const output = (tokens.output ?? 0) + (tokens.reasoning ?? 0)
           const endedAt = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
-          endStep(meter(data.sessionID), data.assistantMessageID, output, endedAt, Date.now(), opts)
+          endStep(meter(data.sessionID), data.assistantMessageID, tokens, endedAt, Date.now(), opts)
+          bump()
+        }),
+      ),
+      context.data.on(
+        "session.step.failed",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.sessionID !== "string" || typeof data?.assistantMessageID !== "string") return
+          // A failure settles the matching step on the spot: the exact tokens
+          // the event reports fold in, and a failure without them simply
+          // clears, so the step does not linger decaying until turn end. The
+          // same clock domain as the started and ended stamps.
+          const tokens = data.tokens ?? {}
+          const endedAt = typeof event.created === "number" && event.created > 0 ? event.created : Date.now()
+          failStep(meter(data.sessionID), data.assistantMessageID, tokens, endedAt, Date.now(), opts)
           bump()
         }),
       ),
       // Turn boundaries: a prompt starts an execution, and its settlement ends
-      // it. The fold resets only here; anything else would split a turn.
+      // it; a queued prompt's delivery (below) is the boundary a single
+      // busy-period `session.execution.started` cannot draw. The fold resets at
+      // those points alone — a steer is deliberately not a boundary.
       context.data.on(
         "session.execution.started",
         safely((event: Event) => {
@@ -334,6 +449,53 @@ export default Plugin.define({
       // closes the fold too, and a second close is a no-op. Without it a turn
       // that ended quietly would bleed into the next one's cumulative figure.
       context.data.on("session.idle", safely(onTurnEnd)),
+      // A queued prompt is a turn boundary of its own: one execution busy
+      // period publishes a single `session.execution.started`, so the host can
+      // process several queued prompts under one begin/end pair. Each item's
+      // delivery type is remembered from its enqueue — and kept current if it
+      // changes while it waits — so a queued delivery can close the fold and
+      // start a fresh one, giving every prompt its own average. A steer leaves
+      // the fold alone, and an item queued before this generation loaded (its
+      // type was never seen) reads as a steer rather than splitting a turn on
+      // a guess. `deliver` reuses the turn-close semantics.
+      context.data.on(
+        "session.inbox.enqueued",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID !== "string") return
+          const delivery = asDelivery(data.item?.delivery)
+          if (delivery) deliveries.set(data.inboxID, delivery)
+        }),
+      ),
+      context.data.on(
+        "session.inbox.delivery.changed",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID !== "string") return
+          const delivery = asDelivery(data.delivery)
+          if (delivery) deliveries.set(data.inboxID, delivery)
+        }),
+      ),
+      context.data.on(
+        "session.inbox.delivered",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID !== "string") return
+          const delivery = deliveries.get(data.inboxID)
+          // The item left the inbox whether or not this generation can use it.
+          deliveries.delete(data.inboxID)
+          if (typeof data?.sessionID !== "string") return
+          deliver(meter(data.sessionID), delivery, Date.now(), opts)
+          bump()
+        }),
+      ),
+      context.data.on(
+        "session.inbox.cancelled",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID === "string") deliveries.delete(data.inboxID)
+        }),
+      ),
       // Cost, tokens and the context window live on the session record; any
       // update to it should repaint the usage line.
       context.data.on("session.usage.updated", safely(() => bump())),
@@ -643,7 +805,7 @@ export default Plugin.define({
           </text>
           <text>
             {stats() && stats()!.count > 0
-              ? `avg ${Math.round(config.statsWindowMs / 1000)}s ${formatRate(stats()!.avg)} · mean ${formatRate(stats()!.mean)} · p95 ${formatRate(stats()!.p95)} · ${stats()!.count} turns`
+              ? `avg ${Math.round(config.statsWindowMs / 1000)}s ${formatRate(stats()!.avg)} · mean ${formatRate(stats()!.mean)} · p95 ${formatRate(stats()!.p95)} (unweighted per turn) · ${stats()!.count} turns`
               : "no completed turns yet"}
           </text>
         </box>

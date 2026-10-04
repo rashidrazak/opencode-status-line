@@ -3,8 +3,13 @@
  * cumulative average since the turn began, and the exact figures steps settle
  * with. The turn fold accumulates exact tokens and decode milliseconds across
  * a turn's steps, so a tool-heavy turn reports one weighted number rather than
- * a row of per-step figures. It also rebuilds a finished turn's settled figure
- * from a session's stored messages, for a process that never saw the events.
+ * a row of per-step figures — the same totals the statistics fold for `avg`
+ * and `mean`, while `p95` stays the unweighted per-turn distribution. A queued
+ * prompt closes the fold like a turn end and begins its own, so several prompts
+ * the host processes inside one execution busy period keep separate averages,
+ * while a steer stays part of the turn it corrects. It also rebuilds a finished
+ * turn's settled figure from a session's stored messages, for a process that
+ * never saw the events.
  *
  * Everything is a pure function of a `Meter` plus options, JSX-free and free
  * of OpenCode imports, so it can be exercised directly:
@@ -14,20 +19,33 @@
 
 export type LiveReading = "sliding" | "cumulative"
 
+/**
+ * What the sliding segment does when no live reading exists: `true` (the
+ * default) keeps it visible resting at zero, `false` hides it, and `"last"`
+ * keeps the last live reading on screen.
+ */
+export type HoldMode = boolean | "last"
+
 export interface RateOptions {
   /** How much streamed output the sliding estimate looks back over. */
   windowMs: number
+  /**
+   * Ceiling on one inter-delta gap charged to the live turn average's decode
+   * clock, in milliseconds: a provider stall contributes at most this much
+   * when deltas resume. `0` counts gaps in full.
+   */
+  maxGapMs: number
   /** Shortest span trusted for a live figure, so the first second does not swing wildly. */
   minSpanMs: number
   /** Below this the meter is noise — a stray delta, or a model that has all but stalled. */
   minTps: number
   /** Character samples land in buckets of this size; finer granularity is only noise. */
   bucketMs: number
-  /** Whether finished steps teach the estimate its characters-per-token ratio. */
+  /** Whether finished steps teach the estimate its characters-per-token ratios. */
   calibrate: boolean
-  /** Seed ratio, used until calibration has something to say. */
+  /** Seed ratio for both classes, used until calibration has something to say. */
   charsPerToken: number
-  /** Bounds for the calibrated ratio; a sample outside them is discarded. */
+  /** Bounds for the calibrated ratios; an accumulated ratio outside them is discarded. */
   ratioMin: number
   ratioMax: number
   /** Accumulate a turn's exact steps into one weighted figure. */
@@ -35,15 +53,16 @@ export interface RateOptions {
   /** Completed figures kept for the statistics. */
   historySamples: number
   /**
-   * Keep the last live sliding reading on screen after the stream stops. The
-   * held value wears the muted shade, so history is visible without pretending
-   * to be live.
+   * What the sliding segment does once no live reading exists. `true` rests it
+   * at zero, dimmed over an empty gauge; `false` hides the segment; `"last"`
+   * keeps the last live reading on screen.
    */
-  holdSliding: boolean
+  holdSliding: HoldMode
 }
 
 export const DEFAULT_RATE: RateOptions = {
   windowMs: 3_000,
+  maxGapMs: 3_000,
   minSpanMs: 800,
   minTps: 0.5,
   bucketMs: 100,
@@ -61,20 +80,38 @@ const MIN_STEP_MS = 50
 /** Longest decode span trusted; beyond this a clock is lying. */
 const MAX_STEP_MS = 3_600_000
 
-/** A step needs this much streamed text before its ratio is worth calibrating from. */
+/**
+ * A class accumulates this much streamed text before its ratio is worth
+ * calibrating from, so several small steps teach the ratio together.
+ */
 const RATIO_MIN_CHARS = 40
 /** Exponential moving average weight given to a fresh ratio. */
 const RATIO_WEIGHT = 0.3
 
+/** Which stream a delta arrived on: text and tool input both feed the output ratio. */
+export type DeltaSource = "text" | "reasoning" | "tool"
+
 export interface Sample {
   /** Bucket start, aligned to bucketMs. */
   at: number
+  /** Visible output characters in the bucket: text plus tool input. */
+  outputChars: number
+  /** Reasoning characters in the bucket. */
+  reasoningChars: number
+}
+
+/** Characters and exact tokens one class has accumulated for its next ratio update. */
+export interface RatioEvidence {
   chars: number
+  tokens: number
 }
 
 export interface Step {
   assistantMessageID: string
-  chars: number
+  /** Streamed visible output characters: text plus tool input. */
+  outputChars: number
+  /** Streamed reasoning characters. */
+  reasoningChars: number
   /** Step start on the event clock. */
   at: number
   /** Step start on the local clock, for when the event clock is unusable. */
@@ -86,6 +123,37 @@ export interface Step {
   tokenAt?: number
   /** First token-bearing chunk on the local clock, for the fallback span. */
   tokenArrivedAt?: number
+  /**
+   * Whether this process watched the step from its first token: the first
+   * delta it saw set `tokenAt` and started the decode clock together. A step
+   * seeded from the record arrives with `tokenAt` already set, so clock time
+   * accumulated later covers only part of the step and settlement must not
+   * prefer it.
+   */
+  fromFirstToken?: boolean
+  /**
+   * The host's stream boundary, on the event clock: `session.step.streamed`
+   * fires when the provider response body ends, before any tool it called
+   * settles. Settlement ends the decode span here when the decode clock is
+   * missing or unusable, so tool runtime is not charged to the step's figure.
+   */
+  streamedAt?: number
+  /**
+   * Decode time of this step, in milliseconds: the sum of the observed
+   * inter-delta gaps and tool-argument windows (see `beginToolInput`), each
+   * capped at `maxGapMs`. The live average's denominator advances only here,
+   * so a pause in output holds the figure instead of decaying.
+   */
+  decodeMs?: number
+  /** Local arrival of the newest observed delta; the next gap is measured from here. */
+  lastDeltaAt?: number
+  /**
+   * Local arrival of a tool-argument stream's opening boundary, while that
+   * stream runs. Its closing boundary charges the window to `decodeMs`; it is
+   * tracked separately from `lastDeltaAt` so an end without a start can never
+   * charge a tool's execution time.
+   */
+  toolOpenAt?: number
 }
 
 /** Exact decode totals of the turn in flight: finished steps only. */
@@ -99,11 +167,19 @@ export interface Final {
   at: number
   /** "turn" when the figure folds the turn, "step" when it is one step's own. */
   kind: "turn" | "step"
+  /** Exact output tokens the figure divides. */
+  tokens: number
+  /** Decode milliseconds it divides them by. */
+  ms: number
 }
 
 export interface TurnSample {
   tps: number
   at: number
+  /** Exact output tokens this figure was folded from. */
+  tokens: number
+  /** Decode milliseconds those tokens took. */
+  ms: number
 }
 
 export interface Meter {
@@ -115,14 +191,22 @@ export interface Meter {
   step?: Step
   /** The turn's exact fold, when turn folding is on. */
   turn: Turn
-  /** Estimated characters per token, calibrated from finished steps. */
-  charsPerToken: number
+  /** Estimated visible output characters per token, calibrated from finished steps. */
+  outputCharsPerToken: number
+  /** Estimated reasoning characters per token, calibrated from finished steps. */
+  reasoningCharsPerToken: number
+  /**
+   * Characters and exact tokens each class has accumulated since its ratio's
+   * last update. Held across steps so a run of small steps still teaches.
+   */
+  evidence: { output: RatioEvidence; reasoning: RatioEvidence }
   /** Last settled figure, shown until something newer replaces it. */
   final?: Final
   /**
    * The last live sliding reading, remembered by `liveRate` as it is produced,
-   * so the dimmed figure held after the stream stops is the last one shown —
-   * never a stale snapshot of a burst. A restore without one rests it at zero.
+   * so `window.hold: "last"` can re-show exactly the value the line showed
+   * live — never a stale snapshot of a burst. A restore without one rests it
+   * at zero.
    */
   sliding?: { tps: number; at: number }
   /**
@@ -139,26 +223,93 @@ export function createMeter(opts: RateOptions = DEFAULT_RATE): Meter {
     samples: [],
     lastDeltaAt: 0,
     turn: { tokens: 0, ms: 0 },
-    charsPerToken: opts.charsPerToken,
+    outputCharsPerToken: opts.charsPerToken,
+    reasoningCharsPerToken: opts.charsPerToken,
+    evidence: { output: { chars: 0, tokens: 0 }, reasoning: { chars: 0, tokens: 0 } },
     history: [],
   }
 }
 
-/** Records `chars` of streamed output arriving at `now` (event clock optional). */
+/** The unsplit fields a sample or step carried before the class ratios. */
+interface LegacyChars {
+  chars?: number
+  outputChars?: number
+  reasoningChars?: number
+}
+
+/**
+ * Brings a meter created before the class split forward, in place. The meter
+ * map rides on `globalThis` across plugin hot reloads, so a save mid-stream
+ * hands the new generation meters of the old shape, whose missing fields would
+ * otherwise read as NaN estimates. The old single ratio seeds both classes;
+ * the old counts never distinguished reasoning from output, so they count as
+ * visible output; the per-class evidence starts empty. Returns the same meter.
+ */
+export function adoptMeter(meter: Meter): Meter {
+  const legacy = meter as Meter & { charsPerToken?: number }
+  meter.outputCharsPerToken ??= legacy.charsPerToken ?? DEFAULT_RATE.charsPerToken
+  meter.reasoningCharsPerToken ??= legacy.charsPerToken ?? DEFAULT_RATE.charsPerToken
+  meter.evidence ??= { output: { chars: 0, tokens: 0 }, reasoning: { chars: 0, tokens: 0 } }
+  for (const sample of meter.samples as (Sample & LegacyChars)[]) {
+    sample.outputChars ??= sample.chars ?? 0
+    sample.reasoningChars ??= 0
+    delete sample.chars
+  }
+  const step = meter.step as (Step & LegacyChars) | undefined
+  if (step) {
+    step.outputChars ??= step.chars ?? 0
+    step.reasoningChars ??= 0
+    delete step.chars
+  }
+  return meter
+}
+
+/**
+ * Records `chars` of streamed output arriving at `now` (event clock optional).
+ *
+ * `source` says which stream the delta arrived on — text, reasoning or tool
+ * input — so the classes accumulate and convert at their own calibrated
+ * ratios; tool input counts as visible output, the host's own split.
+ *
+ * `assistantMessageID` names the step the delta came from. When the events
+ * carry one it must match the open step: output from a step that already
+ * settled — a straggler — is ignored rather than credited to the step now
+ * streaming. An unattributed delta is counted as before.
+ */
 export function observe(
   meter: Meter,
   now: number,
   chars: number,
   eventNow?: number,
   opts: RateOptions = DEFAULT_RATE,
+  assistantMessageID?: string,
+  source: DeltaSource = "text",
 ): void {
   if (chars <= 0) return
+  if (assistantMessageID !== undefined && meter.step?.assistantMessageID !== assistantMessageID) return
+  const reasoning = source === "reasoning"
   const at = Math.floor(now / opts.bucketMs) * opts.bucketMs
   const last = meter.samples[meter.samples.length - 1]
-  if (last && last.at === at) last.chars += chars
-  else meter.samples.push({ at, chars })
+  if (last && last.at === at) {
+    if (reasoning) last.reasoningChars += chars
+    else last.outputChars += chars
+  } else {
+    meter.samples.push({ at, outputChars: reasoning ? 0 : chars, reasoningChars: reasoning ? chars : 0 })
+  }
   if (meter.step) {
-    meter.step.chars += chars
+    // The decode clock: every observed gap advances the step's decode time,
+    // the first delta starting it at zero. Time since the newest delta is
+    // deliberately not charged, and a gap is capped at `maxGapMs`, so the live
+    // average holds through pauses and a provider stall cannot crater it.
+    const gap = meter.step.lastDeltaAt === undefined ? 0 : Math.max(0, now - meter.step.lastDeltaAt)
+    const counted = opts.maxGapMs > 0 ? Math.min(gap, opts.maxGapMs) : gap
+    meter.step.decodeMs = (meter.step.decodeMs ?? 0) + counted
+    meter.step.lastDeltaAt = now
+    if (reasoning) meter.step.reasoningChars += chars
+    else meter.step.outputChars += chars
+    // The first delta this process sees is the step's first token only when
+    // the marker is not already set: a seeded step arrives with `tokenAt`.
+    if (meter.step.tokenAt === undefined) meter.step.fromFirstToken = true
     meter.step.tokenAt ??= eventNow ?? now
     meter.step.tokenArrivedAt ??= now
   }
@@ -179,6 +330,14 @@ export function notePeak(meter: Meter, tps: number): void {
   if (tps > (meter.peak ?? 0)) meter.peak = tps
 }
 
+/**
+ * Converts a class pair into estimated tokens: visible output characters and
+ * reasoning characters, each divided by the ratio its own class calibrated.
+ */
+function estimatedTokens(meter: Meter, outputChars: number, reasoningChars: number): number {
+  return outputChars / meter.outputCharsPerToken + reasoningChars / meter.reasoningCharsPerToken
+}
+
 function prune(meter: Meter, now: number, opts: RateOptions): void {
   // The left edge is open: a bucket exactly one window old has aged out, so a
   // reading works from the deltas the covered span actually holds.
@@ -188,8 +347,8 @@ function prune(meter: Meter, now: number, opts: RateOptions): void {
 
 /**
  * The sliding estimate: streamed characters over the span the retained deltas
- * actually cover, divided by the calibrated ratio, and read as whichever of
- * two views is lower:
+ * actually cover — each class converted at its own calibrated ratio — and read
+ * as whichever of two views is lower:
  *
  * - inter-arrival — what streamed after the oldest retained delta over the span
  *   between the retained deltas themselves. The oldest sample's characters are
@@ -200,8 +359,8 @@ function prune(meter: Meter, now: number, opts: RateOptions): void {
  *
  * Undefined once the stream has been quiet for a window, or while the figure is
  * below `minTps` (silence, by the knob's own meaning). A figure at or above the
- * floor is remembered on the meter, so the held reading is the last value the
- * line showed live — never a stale delta snapshot.
+ * floor is remembered on the meter, so `window.hold: "last"` re-shows the last
+ * value the line showed live — never a stale delta snapshot.
  */
 export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): number | undefined {
   prune(meter, now, opts)
@@ -210,14 +369,14 @@ export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_
   const oldest = meter.samples[0]!
   const newest = meter.samples[meter.samples.length - 1]!
   let total = 0
-  for (const sample of meter.samples) total += sample.chars
-  const afterOldest = total - oldest.chars
+  for (const sample of meter.samples) total += estimatedTokens(meter, sample.outputChars, sample.reasoningChars)
+  const afterOldest = total - estimatedTokens(meter, oldest.outputChars, oldest.reasoningChars)
   // The span floor damps the first instants of a stream, and the window caps
   // both spans so no estimate leans on output older than it looks back over.
   const interSpan = Math.min(Math.max(newest.at - oldest.at, opts.minSpanMs), opts.windowMs)
   const densitySpan = Math.min(Math.max(now - oldest.at, opts.minSpanMs), opts.windowMs)
-  const inter = afterOldest / meter.charsPerToken / (interSpan / 1000)
-  const density = total / meter.charsPerToken / (densitySpan / 1000)
+  const inter = afterOldest / (interSpan / 1000)
+  const density = total / (densitySpan / 1000)
   const tps = Math.min(inter, density)
   if (tps < opts.minTps) return undefined
   meter.sliding = { tps, at: now }
@@ -226,76 +385,251 @@ export function liveRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_
 
 /**
  * The cumulative average: every exact token of this turn's finished steps plus
- * the characters of the step in flight, over the decode time they took. With
- * turn folding off it describes the current step alone. Live only — it needs a
- * step that has emitted its first token.
+ * the step in flight — its output and reasoning characters each at their own
+ * calibrated ratio — over the decode time they took. With turn folding off it
+ * describes the current step alone. Live only — it needs a step that has
+ * emitted its first token.
+ *
+ * The denominator is the step's decode clock, not wall-clock time: each gap
+ * between observed deltas counts up to `maxGapMs` when the later delta lands,
+ * a tool-argument window counts when its closing boundary lands (see
+ * `beginToolInput`/`endToolInput`), and nothing after the newest tick does.
+ * The figure therefore holds still while output is paused — a shell command,
+ * any tool, a permission or question wait — and resumes with the next token.
+ * `now` is accepted as the caller's clock but deliberately does not advance
+ * the span.
  */
 export function cumulativeRate(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): number | undefined {
   const step = meter.step
   if (!step) return undefined
   // Steps that stream tool arguments expose no deltas on the bus, so their
-  // first-token marker never lands. Fall back to the step's arrival: the
-  // average stays on screen through the whole turn instead of vanishing.
-  const startedAt = step.tokenArrivedAt ?? step.arrivedAt
-  const tokens = meter.turn.tokens + step.chars / meter.charsPerToken
-  const ms = meter.turn.ms + Math.max(0, now - startedAt)
+  // first-token marker never lands — and their decode clock stays at zero.
+  // The step in flight is estimated per class, so reasoning chars do not ride
+  // the output ratio or the reverse.
+  const tokens = meter.turn.tokens + estimatedTokens(meter, step.outputChars, step.reasoningChars)
+  const ms = meter.turn.ms + (step.decodeMs ?? 0)
   if (ms < opts.minSpanMs || tokens <= 0) return undefined
   const tps = tokens / (ms / 1000)
   return tps >= opts.minTps ? tps : undefined
 }
 
-/** A step began streaming; remember its start so its end can be exact. */
+/**
+ * A step began streaming; remember its start so its end can be exact.
+ *
+ * The host reports the same assistant message again when a step retries in
+ * place: that is not a new step, so the open one resumes — characters, decode
+ * time and first-token stamps stay — rather than restarting the measurement.
+ * A start naming a different message replaces the open step as before.
+ */
 export function beginStep(meter: Meter, assistantMessageID: string, at: number, arrivedAt: number): void {
+  if (meter.step?.assistantMessageID === assistantMessageID) return
   // The previous figure deliberately stays on screen while this step finds its
   // feet (TTFT, tools): continuity beats a blank line, and the live estimates
   // replace it the moment this step streams.
-  meter.step = { assistantMessageID, chars: 0, at, arrivedAt }
+  meter.step = { assistantMessageID, outputChars: 0, reasoningChars: 0, at, arrivedAt }
 }
 
 /**
- * A step finished with exact `tokens` of output (output + reasoning). Folds it
- * into the turn when folding is on, so the figure is the turn's weighted
- * average rather than one step's, and returns what should be shown.
+ * The host's stream boundary for a step arrived: the provider response body
+ * ended, before any tool it called settled. Recorded on the matching open step
+ * so settlement can end the decode span there. A boundary naming another step,
+ * or arriving with none open, is ignored — a straggler must not stamp the
+ * wrong span.
+ */
+export function recordStreamed(meter: Meter, assistantMessageID: string, at: number): void {
+  const step = meter.step
+  if (!step || step.assistantMessageID !== assistantMessageID) return
+  step.streamedAt = at
+}
+
+/**
+ * A tool call's argument stream began on the open step.
+ *
+ * Tool-argument output is counted in the step's exact `output` tokens, but
+ * this host publishes no `session.tool.input.delta` per chunk for every
+ * provider — only the opening and closing boundaries. Without them the decode
+ * clock stops at the last text or reasoning delta, and the settled figure
+ * would divide the argument tokens by too short a span. The interval since
+ * the previous tick is deliberately dropped rather than charged: a previous
+ * call's execution can sit between its argument stream and the next, and
+ * execution is not the model's time. Argument generation starts immediately
+ * after the last delta in practice, so almost nothing is lost, and the clock
+ * resumes at this boundary.
+ */
+export function beginToolInput(meter: Meter, assistantMessageID: string | undefined, now: number): void {
+  const step = meter.step
+  if (!step) return
+  if (assistantMessageID !== undefined && step.assistantMessageID !== assistantMessageID) return
+  step.toolOpenAt = now
+  step.lastDeltaAt = now
+}
+
+/**
+ * A tool call's argument stream ended: charge the window just passed to the
+ * step's decode clock, capped by `maxGapMs` like any other gap. Deltas that
+ * arrived inside the window already advanced the clock, so only the time
+ * since the newest tick is charged. The call itself executes after this
+ * boundary (`session.tool.called`), so its runtime still is not charged.
+ */
+export function endToolInput(
+  meter: Meter,
+  assistantMessageID: string | undefined,
+  now: number,
+  opts: RateOptions = DEFAULT_RATE,
+): void {
+  const step = meter.step
+  if (!step) return
+  if (assistantMessageID !== undefined && step.assistantMessageID !== assistantMessageID) return
+  if (step.toolOpenAt === undefined) return
+  step.toolOpenAt = undefined
+  const gap = Math.max(0, now - (step.lastDeltaAt ?? now))
+  const counted = opts.maxGapMs > 0 ? Math.min(gap, opts.maxGapMs) : gap
+  step.decodeMs = (step.decodeMs ?? 0) + counted
+  step.lastDeltaAt = now
+}
+
+/**
+ * How long a finished step spent decoding, in milliseconds — the span the
+ * settled figure divides its exact tokens by.
+ *
+ * In priority order: the observed decode clock, when the step was watched from
+ * its first token and the sum is inside the validity bounds; the host's stream
+ * boundary minus that first token, when `session.step.streamed` was observed
+ * (the response body ends before its tools settle, so their runtime is not
+ * charged); then the `session.step.ended` span and the local arrival span, as
+ * before. `ended` is never preferred when a better stamp exists.
+ *
+ * The bounds choose a candidate, they never discard the step: when every
+ * candidate is out of range the most authoritative one is clamped into them,
+ * so the step's exact tokens still fold.
+ */
+function stepSpan(step: Step, endedAt: number, now: number): number {
+  const startAt = step.tokenAt ?? step.at
+  const startArrived = step.tokenArrivedAt ?? step.arrivedAt
+  const candidates: number[] = []
+  // The decode clock only measures a step watched from its first token:
+  // observing the first delta is what sets `tokenAt` and `fromFirstToken`.
+  if (step.fromFirstToken && step.decodeMs !== undefined) candidates.push(step.decodeMs)
+  if (step.streamedAt !== undefined) candidates.push(step.streamedAt - startAt)
+  candidates.push(endedAt - startAt)
+  candidates.push(now - startArrived)
+  const usable = candidates.find((ms) => ms >= MIN_STEP_MS && ms <= MAX_STEP_MS)
+  if (usable !== undefined) return usable
+  return Math.min(Math.max(candidates[0]!, MIN_STEP_MS), MAX_STEP_MS)
+}
+
+/**
+ * The exact token split a settled step reports, as the host keeps it: visible
+ * `output` — tool input included — and `reasoning`. Both optional so a failure
+ * that carries nothing can still close its step.
+ */
+export interface TokenSplit {
+  output?: number
+  reasoning?: number
+}
+
+/**
+ * Adds a class's characters and exact tokens to its evidence; once the class
+ * has accumulated `RATIO_MIN_CHARS` of text, returns the ratio it just
+ * measured. Returns undefined while the evidence is still short, or when the
+ * ratio falls outside the configured bounds. Evidence is cleared once a
+ * measurement was possible, so an out-of-bounds ratio is discarded and the
+ * next update starts fresh, and small steps are held rather than ignored.
+ */
+function calibrate(evidence: RatioEvidence, chars: number, tokens: number, opts: RateOptions): number | undefined {
+  if (chars <= 0 || tokens <= 0) return undefined
+  evidence.chars += chars
+  evidence.tokens += tokens
+  if (evidence.chars < RATIO_MIN_CHARS) return undefined
+  const ratio = evidence.chars / evidence.tokens
+  evidence.chars = 0
+  evidence.tokens = 0
+  return ratio >= opts.ratioMin && ratio <= opts.ratioMax ? ratio : undefined
+}
+
+/**
+ * A step finished with its exact token split. Folds the total into the turn
+ * when folding is on, so the figure is the turn's weighted average rather than
+ * one step's, and returns what should be shown. Each class's evidence also
+ * teaches its own ratio here — output characters over exact output tokens,
+ * reasoning characters over exact reasoning tokens — accumulated across steps
+ * and bounded exactly as the single ratio was.
+ *
+ * The span measures decode time alone (see `stepSpan`), and exact tokens are
+ * always folded when positive: a step with no usable span still contributes
+ * its tokens, with the duration replaced or clamped.
  */
 export function endStep(
   meter: Meter,
   assistantMessageID: string,
-  tokens: number,
+  tokens: TokenSplit,
   endedAt: number,
   now: number,
   opts: RateOptions = DEFAULT_RATE,
 ): number | undefined {
   const step = meter.step
   meter.step = undefined
-  if (!step || step.assistantMessageID !== assistantMessageID || tokens <= 0) return undefined
-  // Prefer the server's own clock for both ends; if those stamps are unusable
-  // (unit drift, replayed event), fall back to when the events actually arrived
-  // — never mixed, and a nonsense figure never reaches the screen. The span
-  // starts at the first token: TTFT is not the model's speed.
-  const startAt = step.tokenAt ?? step.at
-  const startArrived = step.tokenArrivedAt ?? step.arrivedAt
-  const eventMs = endedAt - startAt
-  const arrivalMs = now - startArrived
-  const ms = eventMs >= MIN_STEP_MS && eventMs <= MAX_STEP_MS ? eventMs : arrivalMs
-  if (ms < MIN_STEP_MS || ms > MAX_STEP_MS) return undefined
+  const output = tokens.output ?? 0
+  const reasoning = tokens.reasoning ?? 0
+  const total = output + reasoning
+  if (!step || step.assistantMessageID !== assistantMessageID || total <= 0) return undefined
+  const ms = stepSpan(step, endedAt, now)
   const seconds = ms / 1000
 
-  const stepTps = tokens / seconds
+  const stepTps = total / seconds
   if (opts.turnFold) {
-    meter.turn.tokens += tokens
+    meter.turn.tokens += total
     meter.turn.ms += seconds * 1000
   }
   const folded = opts.turnFold && meter.turn.ms > 0
   const tps = folded ? meter.turn.tokens / (meter.turn.ms / 1000) : stepTps
-  meter.final = { tps, at: now, kind: folded ? "turn" : "step" }
+  meter.final = {
+    tps,
+    at: now,
+    kind: folded ? "turn" : "step",
+    tokens: folded ? meter.turn.tokens : total,
+    ms: folded ? meter.turn.ms : ms,
+  }
   notePeak(meter, tps)
-  if (opts.calibrate && step.chars >= RATIO_MIN_CHARS) {
-    const ratio = step.chars / tokens
-    if (ratio >= opts.ratioMin && ratio <= opts.ratioMax) {
-      meter.charsPerToken = meter.charsPerToken * (1 - RATIO_WEIGHT) + ratio * RATIO_WEIGHT
+  if (opts.calibrate) {
+    const outputRatio = calibrate(meter.evidence.output, step.outputChars, output, opts)
+    if (outputRatio !== undefined) {
+      meter.outputCharsPerToken = meter.outputCharsPerToken * (1 - RATIO_WEIGHT) + outputRatio * RATIO_WEIGHT
+    }
+    const reasoningRatio = calibrate(meter.evidence.reasoning, step.reasoningChars, reasoning, opts)
+    if (reasoningRatio !== undefined) {
+      meter.reasoningCharsPerToken =
+        meter.reasoningCharsPerToken * (1 - RATIO_WEIGHT) + reasoningRatio * RATIO_WEIGHT
     }
   }
   return tps
+}
+
+/**
+ * A step failed. Closes the matching open step on the spot — folding whatever
+ * exact tokens the failure reported, when it reported any — so a failed step
+ * neither lingers decaying until the turn ends nor is silently dropped. The
+ * span is chosen exactly as a clean settlement's (see `stepSpan`), and a
+ * failure that names another message, or arrives with no step open, is
+ * ignored: it must not close the step that is actually streaming.
+ */
+export function failStep(
+  meter: Meter,
+  assistantMessageID: string,
+  tokens: TokenSplit,
+  endedAt: number,
+  now: number,
+  opts: RateOptions = DEFAULT_RATE,
+): number | undefined {
+  const step = meter.step
+  if (!step || step.assistantMessageID !== assistantMessageID) return undefined
+  if ((tokens.output ?? 0) + (tokens.reasoning ?? 0) <= 0) {
+    // The failure reported nothing exact: there is nothing to fold, so the
+    // step simply clears rather than being kept alive to decay.
+    meter.step = undefined
+    return undefined
+  }
+  return endStep(meter, assistantMessageID, tokens, endedAt, now, opts)
 }
 
 /** A turn began: start a fresh fold. The previous figure stays for continuity. */
@@ -308,14 +642,16 @@ export function beginTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT
   meter.step = undefined
 }
 
-/** A turn ended: keep its figure forever, and remember it for the statistics. */
+/** A turn ended: keep its figure forever, and remember its exact totals for the statistics. */
 export function endTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT_RATE): void {
   if (opts.turnFold && meter.turn.ms > 0) {
-    const tps = meter.turn.tokens / (meter.turn.ms / 1000)
-    meter.final = { tps, at: now, kind: "turn" }
-    meter.history.push({ tps, at: now })
+    const { tokens, ms } = meter.turn
+    const tps = tokens / (ms / 1000)
+    meter.final = { tps, at: now, kind: "turn", tokens, ms }
+    meter.history.push({ tps, at: now, tokens, ms })
   } else if (!opts.turnFold && meter.final?.kind === "step") {
-    meter.history.push({ tps: meter.final.tps, at: now })
+    const { tokens, ms } = meter.final
+    meter.history.push({ tps: meter.final.tps, at: now, tokens, ms })
   }
   if (meter.history.length > opts.historySamples) {
     meter.history.splice(0, meter.history.length - opts.historySamples)
@@ -327,10 +663,34 @@ export function endTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT_R
 }
 
 /**
+ * How the host's inbox names an input's delivery: `queue` waits for the turn
+ * in flight and runs as its own turn, `steer` joins the turn it is correcting.
+ */
+export type Delivery = "steer" | "queue"
+
+/**
+ * An enqueued input reached the session. A queued prompt is a turn of its own
+ * even when the host processes it inside the current execution busy period —
+ * one busy period publishes a single `session.execution.started`, so without
+ * this boundary the prompts would fold into one merged figure. Delivery closes
+ * the fold in flight through the existing turn-close semantics and starts a
+ * fresh one (`beginTurn`, including the history cap and the no-op second
+ * close), so the steps that follow accumulate separately. An empty fold is
+ * already fresh, so it is left alone: the delivery must not clear a step that
+ * has started streaming. A steer leaves the fold alone too, and so does a
+ * delivery type this process never saw — an item queued before the plugin
+ * loaded — because splitting a turn on a guess is the worse error.
+ */
+export function deliver(meter: Meter, delivery: Delivery | undefined, now: number, opts: RateOptions = DEFAULT_RATE): void {
+  if (delivery !== "queue" || meter.turn.ms <= 0) return
+  beginTurn(meter, now, opts)
+}
+
+/**
  * A completed step as the session record kept it: exact output tokens over a
  * server-clock decode span. `at` is the first token where the record knows it,
- * `endedAt` the step's completion — the closest the record comes to the span
- * `endStep` settles from.
+ * `endedAt` the record's stream boundary when it keeps one — the response body
+ * ending, before any tool settled — and the step's completion otherwise.
  */
 export interface RecordedStep {
   tokens: number
@@ -352,8 +712,8 @@ export interface RecordedMessage {
 
 /**
  * The earliest point the record can place the step's first token: the first
- * timestamp among its reasoning parts. `time.streamed` is a stream
- * finalisation stamp (milliseconds before `completed`), not a start; text parts
+ * timestamp among its reasoning parts. `time.streamed` is the stream boundary
+ * — the response body ending, an end stamp, not a start; text parts
  * carry no timing at all, and a tool part is stamped when its call is
  * registered, after its arguments streamed. A message without a timed reasoning
  * part has no first token in the record, and callers fall back to its start.
@@ -374,7 +734,11 @@ export function firstTokenAt(message: RecordedMessage): number | undefined {
  * output counts, and one without a recorded end or without output is not a
  * measurement. The span starts at the first reasoning timestamp where the
  * record keeps one — the first token — and at the message's own start
- * otherwise, which charges TTFT but cannot invent a timeline.
+ * otherwise, which charges TTFT but cannot invent a timeline. It ends at the
+ * message's stream boundary when the record keeps one — the provider response
+ * body ending, before any tool settled, the same end the live settlement
+ * prefers — and at its completion otherwise, which charges tool time but
+ * cannot invent a boundary.
  *
  * Returns undefined when the messages hold no user message at all: the TUI
  * cache can carry only the newest page of a long session, and folding its tail
@@ -393,7 +757,7 @@ export function recordedSteps(messages: readonly RecordedMessage[]): RecordedSte
     }
     if (message?.type !== "assistant") continue
     const started = firstTokenAt(message) ?? message.time?.created
-    const ended = message.time?.completed
+    const ended = message.time?.streamed ?? message.time?.completed
     const tokens = (message.tokens?.output ?? 0) + (message.tokens?.reasoning ?? 0)
     if (typeof started !== "number" || typeof ended !== "number" || tokens <= 0) continue
     steps.push({ tokens, at: started, endedAt: ended })
@@ -412,12 +776,12 @@ function measurable(step: RecordedStep): boolean {
 /**
  * Rebuild the settled state a finished turn left on the line, from its
  * recorded steps — the resume counterpart of the live `endStep`/`endTurn`
- * pair, for a process that never saw the events. The figure is close to the
- * live one, not bit-identical: the live span ran between event timestamps the
- * record does not keep, and the record's own end carries the finalisation
- * tail, so around a percent of difference is expected and accepted — tool-time
- * heuristics do not narrow it (starting at the last tool's creation, or
- * subtracting tool runs, both overshoot). `final` takes the folded
+ * pair, for a process that never saw the events. Each step's span ends where
+ * the record's stream boundary says the response body ended — the same basis
+ * the live settlement prefers — so tools a step called no longer depress the
+ * figure after a restart. The rebuilt figure is close to, not bit-identical
+ * with, the live one, because the live span may have run on the observed
+ * decode clock instead. `final` takes the folded
  * figure and the sliding reading rests at zero, so the segment keeps its shape
  * — an empty gauge and a resting `↯` — without pretending a window the samples
  * could not support. The turn fold is left empty: a step beginning later must
@@ -431,9 +795,9 @@ export function restoreFinal(
   opts: RateOptions = DEFAULT_RATE,
 ): number | undefined {
   let tps: number | undefined
+  let tokens = 0
+  let ms = 0
   if (opts.turnFold) {
-    let tokens = 0
-    let ms = 0
     for (const step of steps) {
       if (!measurable(step)) continue
       tokens += step.tokens
@@ -444,12 +808,14 @@ export function restoreFinal(
     for (let index = steps.length - 1; index >= 0; index--) {
       const step = steps[index]!
       if (!measurable(step)) continue
-      tps = step.tokens / ((step.endedAt - step.at) / 1000)
+      tokens = step.tokens
+      ms = step.endedAt - step.at
+      tps = tokens / (ms / 1000)
       break
     }
   }
   if (tps === undefined) return undefined
-  meter.final = { tps, at: now, kind: opts.turnFold ? "turn" : "step" }
+  meter.final = { tps, at: now, kind: opts.turnFold ? "turn" : "step", tokens, ms }
   meter.sliding = { tps: 0, at: now }
   notePeak(meter, tps)
   return tps
@@ -507,13 +873,17 @@ export const USAGE_LABELS: Record<LabelStyle, UsageLabels> = {
  * The two families have a life of their own rather than appearing and
  * vanishing with the stream:
  *
- *   sliding     live while the retained deltas give a rate, then the last reading held
+ *   sliding     live while the retained deltas give a rate, then at rest —
+ *               `window.hold` says whether it shows `0.0`, hides, or keeps
+ *               the last reading
  *   cumulative  live while a step is in flight, then the settled turn average
  *
- * A held or settled figure wears `live: false` and is drawn dimmed, so history
- * stays visible without pretending to be current. With holding off the sliding
- * reading disappears as it used to, and with `readings: []` only the settled
- * figure remains.
+ * A resting, held or settled figure wears `live: false` and is drawn dimmed,
+ * so the line keeps its shape without pretending to be current. The sliding
+ * segment rests at zero — the same shape a resumed session shows — unless
+ * `"last"` keeps the previous value or `false` drops the segment; while the
+ * window still holds deltas the live figure shows as before. With
+ * `readings: []` only the settled figure remains.
  *
  * `labels` names the figures (`USAGE_LABELS` holds the icon and word sets);
  * the counts and the geometry never depend on it.
@@ -529,8 +899,14 @@ export function display(
   if (readings.includes("sliding")) {
     const tps = liveRate(meter, now, opts)
     if (tps !== undefined) shown.push({ key: "sliding", label: labels.sliding, tps, live: true })
-    else if (opts.holdSliding && meter.sliding) {
-      shown.push({ key: "sliding", label: labels.sliding, tps: meter.sliding.tps, live: false })
+    else if (opts.holdSliding === "last") {
+      if (meter.sliding) {
+        shown.push({ key: "sliding", label: labels.sliding, tps: meter.sliding.tps, live: false })
+      }
+    } else if (opts.holdSliding === true) {
+      // No live reading: rest the segment at zero so the line keeps its shape
+      // over an empty gauge, rather than re-showing a stale figure.
+      shown.push({ key: "sliding", label: labels.sliding, tps: 0, live: false })
     }
   }
   if (readings.includes("cumulative")) {
@@ -567,25 +943,47 @@ export function peakTps(meter: Meter): number {
 }
 
 export interface TpsStats {
-  /** Mean of the samples inside the rolling window. */
+  /** Token-weighted mean of the samples inside the rolling window. */
   avg: number
-  /** Mean of every sample. */
+  /** Token-weighted mean of every sample: all tokens over all decode time. */
   mean: number
-  /** 95th percentile of every sample. */
+  /** Unweighted 95th percentile of every sample's own figure. */
   p95: number
   count: number
 }
 
+/**
+ * The statistics behind the dialog. `avg` and `mean` fold what each finished
+ * turn actually produced — its exact tokens over its decode milliseconds — so
+ * one large slow turn outweighs a handful of tiny fast ones. `p95` deliberately
+ * stays an unweighted per-turn distribution: each finished turn counts once,
+ * whatever its size, so it reads as a typical high figure rather than an
+ * overall speed.
+ */
 export function tpsStats(meter: Meter, now: number, windowMs: number): TpsStats {
   const samples = meter.history
   if (samples.length === 0) return { avg: 0, mean: 0, p95: 0, count: 0 }
   const window = samples.filter((sample) => now - sample.at <= windowMs)
-  const avg =
-    window.length > 0 ? window.reduce((sum, sample) => sum + sample.tps, 0) / window.length : 0
-  const mean = samples.reduce((sum, sample) => sum + sample.tps, 0) / samples.length
   const sorted = samples.map((sample) => sample.tps).sort((a, b) => a - b)
   const p95 = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] ?? 0
-  return { avg, mean, p95, count: samples.length }
+  return { avg: weightedRate(window), mean: weightedRate(samples), p95, count: samples.length }
+}
+
+/** Token totals over decode-time totals — the honest mean of unlike turns. */
+function weightedRate(samples: readonly TurnSample[]): number {
+  let tokens = 0
+  let ms = 0
+  for (const sample of samples) {
+    // The meter map survives a hot reload on `globalThis`, so a history kept
+    // from a generation before the totals existed can hold samples without
+    // them. They are skipped rather than poisoning the sums with `undefined`:
+    // their figures still count in `count` and `p95`, and the weighted figures
+    // catch up as new turns land.
+    if (!Number.isFinite(sample.tokens) || !Number.isFinite(sample.ms)) continue
+    tokens += sample.tokens
+    ms += sample.ms
+  }
+  return ms > 0 ? tokens / (ms / 1000) : 0
 }
 
 /**

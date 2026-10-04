@@ -291,17 +291,18 @@ the rest keep the defaults above.
 
 ## 5. Understand and tune the speed meter
 
-OpenCode only reports exact token counts when a step finishes. While the model
-is streaming, the plugin **estimates** speed from the characters it sees, then
-corrects the estimate against the exact counts as they arrive.
+OpenCode only reports exact token counts when a step settles — it finishes or
+fails. While the model is streaming, the plugin **estimates** speed from the
+characters it sees, then corrects the estimate against the exact counts as they
+arrive.
 
 ### The three figures
 
 | Figure | Label | What it means |
 | --- | --- | --- |
-| Sliding | `↯` | Speed over the last few seconds — what is happening right now |
-| Cumulative | `μ` or `avg` | Average across this turn so far: exact tokens from finished steps plus the step in flight |
-| Settled | `μ` / `avg` / `✓` | The final figure from a finished step or turn, kept on screen |
+| Sliding | `↯` | Speed over the last few seconds — what is happening right now; rests at `0.0` when nothing is streaming (see [`window.hold`](#the-speed-window)) |
+| Cumulative | `μ` or `avg` | Average across this turn so far: exact tokens from finished steps plus the step in flight, over the time spent producing tokens |
+| Settled | `μ` / `avg` / `✓` | The final figure from a finished step or turn, kept on screen; measured on decode time, so tool runtime is not charged |
 
 ### Which readings you see
 
@@ -316,23 +317,70 @@ corrects the estimate against the exact counts as they arrive.
 - `[]` — no live readings; show only the settled figure (the segment can be
   empty until something finishes)
 
-### The sliding window
+### The speed window
 
-These keys control the `↯` reading:
+These keys tune the live speed readings — the sliding figure (`↯`) and the
+turn average's decode clock (`μ`):
 
 | Key | Default | Allowed | What it does |
 | --- | --- | --- | --- |
 | `window.ms` | `3000` | 1–600000 | How far back the window looks, in milliseconds. Bigger = smoother, slower to react |
+| `window.maxGapMs` | `3000` | 0–600000 | Longest pause between deltas that counts toward the turn average, in milliseconds. `0` counts pauses in full |
 | `window.minSpanMs` | `800` | 0–600000 | Ignore spans shorter than this, so the first moment of a stream does not swing wildly |
 | `window.minTps` | `0.5` | 0–10000 | Speeds below this count as silence and hide the reading |
 | `window.bucketMs` | `100` | 1–10000 | Group incoming characters into buckets of this size before measuring |
-| `window.hold` | `true` | true/false | Keep the last reading on screen (dimmed) after the stream stops |
+| `window.hold` | `true` | `true` / `false` / `"last"` | What the sliding figure (`↯`) does when no live reading exists: `true` rests it at `0.0` (dimmed, over an empty gauge), `false` hides the segment, `"last"` keeps the last value on screen |
 
 ```json
 {
   "window": { "ms": 5000, "hold": false }
 }
 ```
+
+When output stops, the sliding figure settles at `↯ 0.0` instead of freezing
+at its last value: with the default `window.hold: true` the dimmed figure and
+its empty gauge keep the line's shape — the same shape a resumed session
+already shows. `false` drops the segment whenever there is no live reading,
+and `"last"` keeps the previous behaviour of holding the last value on screen.
+
+The turn average (`μ`) measures token-producing time only: each gap between
+streamed deltas counts when the later delta arrives, and nothing after the
+newest delta does, so the figure holds still through a shell command, tool run,
+permission prompt or question wait and resumes when tokens do. A single pause
+longer than `window.maxGapMs` counts only up to that ceiling, so a provider
+stall cannot crater the figure; set it to `0` to count pauses in full. A tool
+call's argument generation counts too, even when the provider streams no
+per-chunk tool-input events: the window between `session.tool.input.started`
+and `session.tool.input.ended` is charged when it closes, so argument tokens
+are not divided by a span that stopped early. Tool runtime still does not
+count — execution begins after that window.
+
+One limit is worth knowing: the meter measures when tokens arrive, not when the
+model produced them. A provider that buffers a response and delivers it in one
+or two chunks gives the line nothing to measure but the flush, so a buffered
+first response can read faster than the model's steady pace; once responses
+stream normally, the figure returns to the true arrival rate. The host's own
+timestamps see the same flush, so there is nothing better available on this
+side.
+
+The figure a step settles with keeps the same basis: its span ends at the
+observed decode clock when the stream was watched from its first token, or at
+the host's stream boundary — the moment the provider response body ended — when
+the plugin met the step mid-stream; only without either does it fall back to
+the step's own end and arrival times. A shell command or any tool the step
+called therefore does not depress the settled figure, and a step with no usable
+span still folds its exact tokens rather than being dropped.
+
+Failed and retried steps settle cleanly too. A step that fails closes as soon
+as the failure is reported, folding any exact tokens the failure carried, so an
+interrupted step neither keeps decaying until the turn ends nor vanishes
+uncounted; a failure without token counts simply closes the step. If the host
+retries the same assistant message in place, the open step resumes — the
+characters and decode time already measured are kept — and streamed output is
+attributed to the step that produced it, so a late delta from a finished step
+is ignored instead of being charged to the next one. The pause between a failed
+attempt and its retry counts no more than `window.maxGapMs`, like any other
+pause.
 
 ### The gauge
 
@@ -363,15 +411,26 @@ wears `✓`.
 { "turn": { "fold": false } }
 ```
 
+Queued prompts are turn boundaries of their own. When you queue a prompt and
+OpenCode runs it back to back with the one before — even inside the same
+execution — the queue's delivery ends the first prompt's average and starts a
+fresh one, so the stats dialog counts two turns rather than showing one merged
+figure. A steer is different: it belongs to the turn it corrects, so delivering
+one mid-turn never resets the fold or splits the average.
+
 ### Characters per token
 
-The plugin converts streamed characters into tokens using a ratio. It starts at
-4 characters per token and learns from each finished step.
+The plugin converts streamed characters into tokens using two ratios — one for
+visible output (text and tool input), one for reasoning — and starts both at 4
+characters per token. Each finished step reports its exact output and reasoning
+token counts, so each class's ratio learns from its own split. Small steps
+count: a ratio updates once its class has accumulated enough text, even when no
+single step has.
 
 | Key | Default | Allowed | What it does |
 | --- | --- | --- | --- |
-| `calibration.enabled` | `true` | true/false | Let finished steps adjust the ratio |
-| `calibration.charsPerToken` | `4` | 0.5–50 | Starting guess, used until calibration has data |
+| `calibration.enabled` | `true` | true/false | Let finished steps adjust the ratios |
+| `calibration.charsPerToken` | `4` | 0.5–50 | Starting guess for both ratios, used until calibration has data |
 | `calibration.min` | `2.5` | 0.5–50 | Guesses below this are thrown away |
 | `calibration.max` | `7` | 0.5–50 | Guesses above this are thrown away |
 
@@ -541,15 +600,21 @@ Run `/opencode-status-line` (alias `/tps`, also available in the command
 palette) to see the numbers behind the meter:
 
 - the current readings, in the same shape as the line
-- `avg` — the average over the last `stats.windowMs` of finished turns
-- `mean` — the average of every kept figure
-- `p95` — the 95th percentile, a typical high figure
+- `avg` — the speed of the turns finished in the last `stats.windowMs`: every
+  token they produced over every millisecond they spent decoding, so a long
+  turn counts for more than a short one
+- `mean` — the same token-weighted figure across every kept turn
+- `p95` — the 95th percentile of the finished turns themselves, each counting
+  once whatever its size; an unweighted per-turn distribution, so it reads as a
+  typical high figure rather than an overall speed
 - how many figures are behind the statistics
 
 The stats are per process. Restarting OpenCode clears them, because the plugin
 does not store them on disk. A resumed session rebuilds its last settled figure
-from the stored messages, so the meter segment is not blank after a restart —
-the live `↯` figure returns with the next stream.
+from the stored messages — ending each step's span at the same stream boundary
+the live figure prefers, so a tool-heavy turn does not read lower after a
+restart. The meter segment is not blank after the restart; the live `↯` figure
+returns with the next stream.
 
 ---
 
@@ -582,10 +647,11 @@ Every key, its default, and the values it accepts. All keys are optional.
 | --- | --- | --- |
 | `readings` | `["sliding", "cumulative"]` | `"sliding"`, `"cumulative"`, or both; `[]` for settled figures only |
 | `window.ms` | `3000` | number 1–600000 |
+| `window.maxGapMs` | `3000` | number 0–600000 (0 = uncapped) |
 | `window.minSpanMs` | `800` | number 0–600000 |
 | `window.minTps` | `0.5` | number 0–10000 |
 | `window.bucketMs` | `100` | number 1–10000 |
-| `window.hold` | `true` | `true` / `false` |
+| `window.hold` | `true` | `true` / `false` / `"last"` |
 | `turn.fold` | `true` | `true` / `false` |
 | `calibration.enabled` | `true` | `true` / `false` |
 | `calibration.charsPerToken` | `4` | number 0.5–50 |
@@ -660,7 +726,7 @@ Copy any block into your config file as a starting point.
 }
 ```
 
-**A calmer meter** — longer window, no held reading:
+**A calmer meter** — longer window, no reading when idle:
 
 ```json
 {

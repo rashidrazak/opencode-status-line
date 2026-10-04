@@ -26,13 +26,78 @@ and this project adheres to
 
 ### Fixed
 
+- **The live speed estimate now converts visible output and reasoning at
+  separate calibrated ratios.** The plugin learned one characters-per-token
+  ratio from finished steps, but reasoning and output have different
+  characters-per-token densities, so a single ratio skewed the estimate
+  whenever a model reasoned. The meter now keeps an output ratio — text and
+  tool input together, the host's own split — and a reasoning ratio, each
+  seeded from `calibration.charsPerToken`, bounded by the same
+  `calibration.min`/`calibration.max`, and updated from a settled step's exact
+  output and reasoning token counts. A class accumulates characters across
+  steps, so a run of small steps still teaches its ratio instead of being
+  ignored.
 - **The live speed reading (`↯`) now tells the truth on slow and stalled
   streams.** It is estimated over the span the retained stream deltas actually
   cover, so output arriving a second or two apart reads its real pace instead of
-  up to twice as fast, streams slower than the window show no live reading
-  rather than a floor near 1.25 tok/s, and the dimmed figure left behind when
-  output stops keeps the last value the line actually showed instead of jumping
-  back to the burst peak. Fast streams read as before.
+  up to twice as fast, and streams slower than the window show no live reading
+  rather than a floor near 1.25 tok/s. When output stops, the figure no longer
+  freezes at its last value: it rests at `↯ 0.0`, dimmed over an empty gauge —
+  the same shape a resumed session shows — so a shell command, a tool run or a
+  stalled stream reads as genuinely idle. `window.hold: "last"` restores the
+  previous hold-the-last-value behaviour, and `window.hold: false` hides the
+  segment whenever there is no live reading. Fast streams read as before.
+- **The turn average (`μ`) now counts token-producing time only.** Each gap
+  between streamed deltas advances its decode clock, and a pause longer than
+  `window.maxGapMs` (default `3000` ms; `0` counts pauses in full) counts only
+  up to that ceiling. A shell command, tool run, permission prompt or question
+  wait no longer drags the live average down while it runs, and slow-but-steady
+  output still reads slow.
+- **The settled speed figure no longer counts tool time.** When a step settles,
+  its span is the observed decode clock, or the host's stream boundary — the
+  moment the provider response body ended, published before tool settlement —
+  for a step the plugin met mid-stream, before the step's own end and arrival
+  times. A shell command or any tool that ran after the response ended no
+  longer depresses the final figure, and a step whose span is unusable still
+  folds its exact tokens rather than being dropped.
+- **A resumed session's rebuilt speed figure now uses the same decode basis as
+  the live one.** After a restart the plugin rebuilds the last settled figure
+  from the stored messages, but it ended each step's span at the message's
+  completion time, which included any tool the step ran, so a tool-heavy turn
+  read lower than the live figure it replaced. The rebuild now ends the span at
+  the stored stream boundary — the same moment the live settlement prefers —
+  falling back to completion time only when the record keeps no boundary, so
+  the figure you come back to is not dragged down by tool time.
+- **The stats dialog's `avg` and `mean` are now token-weighted.** Each is the
+  exact tokens the finished turns produced over the decode time those tokens
+  took, so a few tiny fast turns can no longer outvote one large slow one. `p95`
+  deliberately stays an unweighted per-turn distribution — each finished turn
+  counts once whatever its size — and the dialog labels it
+  `(unweighted per turn)`, with the manual explaining the difference.
+- **A failed or retried step no longer leaves the speed meter guessing.** When a
+  step fails, the meter closes it the moment the failure is reported and folds
+  whatever exact tokens the event carried, so an interrupted step neither keeps
+  decaying until the turn ends nor disappears uncounted. When the host retries
+  the same assistant message in place, the open step resumes — the characters
+  and decode time already measured are kept — and streamed output is matched to
+  the step that produced it, so a straggler arriving after a retry cannot be
+  credited to the next step.
+- **Each queued prompt now gets its own turn average.** OpenCode can run several
+  queued prompts back to back inside one execution, publishing a single
+  `session.execution.started`, and the plugin folded them into one figure. A
+  queued prompt's delivery now ends the prompt before it and starts a fresh
+  fold, so the statistics dialog gets one turn sample per queued prompt instead
+  of a merged average. A mid-turn steer is not a boundary: it stays part of the
+  turn it corrects and never splits the average.
+- **Tool-call argument generation now counts toward a settled step.** Some
+  providers stream no per-chunk `session.tool.input.delta` events, so the
+  decode clock stopped at the last text or reasoning delta while the argument
+  tokens still counted in the step's exact output — a short step could settle
+  faster than the model produced it. The meter now charges the argument
+  stream's window — `session.tool.input.started` to `session.tool.input.ended`
+  — to the decode clock, capped by `window.maxGapMs` like any other gap. Tool
+  runtime still does not count: execution begins only after the argument
+  window closes.
 
 ## [1.1.0] - 2026-10-03
 

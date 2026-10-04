@@ -159,9 +159,28 @@ describe("validation", () => {
     expect(warnings.some((warning) => warning.includes("cap.mode"))).toBe(true)
   })
 
-  test("window.hold can turn the held reading off", () => {
-    const { config } = read({ [PROJECT]: JSON.stringify({ window: { hold: false } }) })
-    expect(config.holdSliding).toBe(false)
+  test("window.hold takes true, false and \"last\", and rejects anything else", () => {
+    expect(read({}).config.holdSliding).toBe(true)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { hold: true } }) }).config.holdSliding).toBe(true)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { hold: false } }) }).config.holdSliding).toBe(false)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { hold: "last" } }) }).config.holdSliding).toBe("last")
+    for (const bad of ["latest", "true", 1]) {
+      const { config, warnings } = read({ [PROJECT]: JSON.stringify({ window: { hold: bad } }) })
+      expect(config.holdSliding).toBe(DEFAULT_CONFIG.holdSliding)
+      expect(warnings.some((warning) => warning.includes("window.hold"))).toBe(true)
+    }
+  })
+
+  test("window.maxGapMs bounds the decode clock's gaps", () => {
+    expect(read({}).config.maxGapMs).toBe(3_000)
+    // 0 means uncapped: the full inter-delta gap counts.
+    expect(read({ [PROJECT]: JSON.stringify({ window: { maxGapMs: 0 } }) }).config.maxGapMs).toBe(0)
+    expect(read({ [PROJECT]: JSON.stringify({ window: { maxGapMs: 600_000 } }) }).config.maxGapMs).toBe(600_000)
+    for (const bad of [-1, 600_001, "soon"]) {
+      const { config, warnings } = read({ [PROJECT]: JSON.stringify({ window: { maxGapMs: bad } }) })
+      expect(config.maxGapMs).toBe(DEFAULT_CONFIG.maxGapMs)
+      expect(warnings.some((warning) => warning.includes("window.maxGapMs"))).toBe(true)
+    }
   })
 
   test("surface takes one slot or several at once", () => {
@@ -422,10 +441,16 @@ describe("validation", () => {
 
 test("rateOptions mirrors the maths half of the config", () => {
   const { config } = read(
-    { [PROJECT]: JSON.stringify({ window: { ms: 2_000, bucketMs: 50 }, calibration: { enabled: false } }) },
+    {
+      [PROJECT]: JSON.stringify({
+        window: { ms: 2_000, maxGapMs: 5_000, bucketMs: 50 },
+        calibration: { enabled: false },
+      }),
+    },
   )
   const opts = rateOptions(config)
   expect(opts.windowMs).toBe(2_000)
+  expect(opts.maxGapMs).toBe(5_000)
   expect(opts.bucketMs).toBe(50)
   expect(opts.calibrate).toBe(false)
   expect(opts.turnFold).toBe(true)

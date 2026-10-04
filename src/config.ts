@@ -23,7 +23,7 @@ import {
   TONE_KEYS,
   type ToneOverrides,
 } from "./palette.ts"
-import { DEFAULT_RATE, type LabelStyle, type LiveReading, type RateOptions } from "./rate.ts"
+import { DEFAULT_RATE, type HoldMode, type LabelStyle, type LiveReading, type RateOptions } from "./rate.ts"
 import type { CapStyle } from "./render.ts"
 
 /**
@@ -105,11 +105,12 @@ export interface Config {
   /** Which live readings the line shows, in order. Empty shows only settled figures. */
   readings: LiveReading[]
   windowMs: number
+  maxGapMs: number
   minSpanMs: number
   minTps: number
   bucketMs: number
-  /** Keep the last sliding reading on screen after a stream stops. */
-  holdSliding: boolean
+  /** What the sliding segment does with no live reading: rest at zero, hide, or hold the last. */
+  holdSliding: HoldMode
   calibrate: boolean
   charsPerToken: number
   ratioMin: number
@@ -153,6 +154,7 @@ export const DEFAULT_CONFIG: Config = {
   surface: ["app"],
   readings: ["sliding", "cumulative"],
   windowMs: DEFAULT_RATE.windowMs,
+  maxGapMs: DEFAULT_RATE.maxGapMs,
   minSpanMs: DEFAULT_RATE.minSpanMs,
   minTps: DEFAULT_RATE.minTps,
   bucketMs: DEFAULT_RATE.bucketMs,
@@ -212,6 +214,7 @@ export function segmentsFor(config: Config, surface: Surface): UsageSegment[] {
 export function rateOptions(config: Config): RateOptions {
   return {
     windowMs: config.windowMs,
+    maxGapMs: config.maxGapMs,
     minSpanMs: config.minSpanMs,
     minTps: config.minTps,
     bucketMs: config.bucketMs,
@@ -381,10 +384,11 @@ function apply(draft: Draft, where: string, raw: unknown): void {
   const window = group(draft, where, root, "window")
   if (window) {
     num(draft, where, "window.ms", window.ms, 1, 600_000, (value) => (config.windowMs = value))
+    num(draft, where, "window.maxGapMs", window.maxGapMs, 0, 600_000, (value) => (config.maxGapMs = value))
     num(draft, where, "window.minSpanMs", window.minSpanMs, 0, 600_000, (value) => (config.minSpanMs = value))
     num(draft, where, "window.minTps", window.minTps, 0, 10_000, (value) => (config.minTps = value))
     num(draft, where, "window.bucketMs", window.bucketMs, 1, 10_000, (value) => (config.bucketMs = value))
-    bool(draft, where, "window.hold", window.hold, (value) => (config.holdSliding = value))
+    holdMode(draft, where, "window.hold", window.hold, (value) => (config.holdSliding = value))
   }
 
   const calibration = group(draft, where, root, "calibration")
@@ -605,6 +609,16 @@ function bool(draft: Draft, where: string, key: string, value: unknown, set: (va
     return
   }
   set(value)
+}
+
+/** `true`, `false` or `"last"` — the sliding segment's three resting behaviours. */
+function holdMode(draft: Draft, where: string, key: string, value: unknown, set: (value: HoldMode) => void): void {
+  if (value === undefined) return
+  if (value === true || value === false || value === "last") {
+    set(value)
+    return
+  }
+  draft.warnings.push(`${where}: ${key} must be true, false or "last" — kept the previous value`)
 }
 
 /** The valid, de-duplicated segments in a raw list, in order; warns about the rest. */
