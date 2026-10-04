@@ -82,6 +82,13 @@ and this project adheres to
   and decode time already measured are kept — and streamed output is matched to
   the step that produced it, so a straggler arriving after a retry cannot be
   credited to the next step.
+- **Each queued prompt now gets its own turn average.** OpenCode can run several
+  queued prompts back to back inside one execution, publishing a single
+  `session.execution.started`, and the plugin folded them into one figure. A
+  queued prompt's delivery now ends the prompt before it and starts a fresh
+  fold, so the statistics dialog gets one turn sample per queued prompt instead
+  of a merged average. A mid-turn steer is not a boundary: it stays part of the
+  turn it corrects and never splits the average.
 
 ## [1.1.0] - 2026-10-03
 

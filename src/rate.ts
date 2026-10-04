@@ -4,9 +4,12 @@
  * with. The turn fold accumulates exact tokens and decode milliseconds across
  * a turn's steps, so a tool-heavy turn reports one weighted number rather than
  * a row of per-step figures — the same totals the statistics fold for `avg`
- * and `mean`, while `p95` stays the unweighted per-turn distribution. It also
- * rebuilds a finished turn's settled figure from a session's stored messages,
- * for a process that never saw the events.
+ * and `mean`, while `p95` stays the unweighted per-turn distribution. A queued
+ * prompt closes the fold like a turn end and begins its own, so several prompts
+ * the host processes inside one execution busy period keep separate averages,
+ * while a steer stays part of the turn it corrects. It also rebuilds a finished
+ * turn's settled figure from a session's stored messages, for a process that
+ * never saw the events.
  *
  * Everything is a pure function of a `Meter` plus options, JSX-free and free
  * of OpenCode imports, so it can be exercised directly:
@@ -602,6 +605,30 @@ export function endTurn(meter: Meter, now: number, opts: RateOptions = DEFAULT_R
   // empty fold and simply does nothing.
   meter.turn = { tokens: 0, ms: 0 }
   meter.step = undefined
+}
+
+/**
+ * How the host's inbox names an input's delivery: `queue` waits for the turn
+ * in flight and runs as its own turn, `steer` joins the turn it is correcting.
+ */
+export type Delivery = "steer" | "queue"
+
+/**
+ * An enqueued input reached the session. A queued prompt is a turn of its own
+ * even when the host processes it inside the current execution busy period —
+ * one busy period publishes a single `session.execution.started`, so without
+ * this boundary the prompts would fold into one merged figure. Delivery closes
+ * the fold in flight through the existing turn-close semantics and starts a
+ * fresh one (`beginTurn`, including the history cap and the no-op second
+ * close), so the steps that follow accumulate separately. An empty fold is
+ * already fresh, so it is left alone: the delivery must not clear a step that
+ * has started streaming. A steer leaves the fold alone too, and so does a
+ * delivery type this process never saw — an item queued before the plugin
+ * loaded — because splitting a turn on a guess is the worse error.
+ */
+export function deliver(meter: Meter, delivery: Delivery | undefined, now: number, opts: RateOptions = DEFAULT_RATE): void {
+  if (delivery !== "queue" || meter.turn.ms <= 0) return
+  beginTurn(meter, now, opts)
 }
 
 /**

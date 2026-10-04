@@ -74,3 +74,17 @@ Read before touching `src/rate.ts`, the meter/usage branches of
   plugin's to invent around.
 - `session.idle` also closes a turn as a late belt; `endTurn` is idempotent, so
   double-closing is safe.
+- A queued prompt is a turn boundary of its own. One execution busy period
+  publishes a single `session.execution.started`, so several queued prompts the
+  host promotes inside it would otherwise fold into one figure. The entry
+  remembers each `session.inbox.enqueued` item's delivery type by inbox ID,
+  keeps it current through `session.inbox.delivery.changed`, drops it on
+  `session.inbox.cancelled`, and on `session.inbox.delivered` hands the
+  remembered type to `deliver` (`src/rate.ts`): `queue` runs `beginTurn` when a
+  fold is actually in flight — an empty fold is already fresh, and the call
+  must not clear a step that has started streaming — reusing the
+  close-into-history-then-fresh-fold semantics of an execution start, cap
+  included; `steer` — and an unknown type, as when the plugin loaded after the
+  item was queued — leaves the fold alone. The map rides on `globalThis`
+  beside the meters, for the same reason: a hot reload between enqueue and
+  delivery must not lose the boundary.

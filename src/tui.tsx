@@ -16,8 +16,9 @@
  * together:
  *
  *   sliding     ↯  what the last few seconds look like, right now
- *   cumulative  μ  the average since the turn began (exact tokens from every
- *                  finished step of the turn plus the step in flight)
+ *   cumulative  μ  the average since the turn began — exact tokens from every
+ *                  finished step of the turn plus the step in flight; a queued
+ *                  prompt starts its own turn, a steer stays in the current one
  *
  * The settled figure measures decode time: its span prefers the observed decode
  * clock, then the host's stream boundary (`session.step.streamed`, published
@@ -45,13 +46,14 @@ import { contextBarWidth, loadConfig, rateOptions, resolvedPadding, segmentsFor,
 import { diffDue, diffKey, diffParts, diffTotals, type DiffReading, type DiffStat, type StatusFile } from "./diff.ts"
 import { createGuard } from "./guard.ts"
 import { HOST_PALETTE, inkColor, resolvePalette } from "./palette.ts"
-import type { DeltaSource, Display, Meter } from "./rate.ts"
+import type { DeltaSource, Delivery, Display, Meter } from "./rate.ts"
 import {
   active,
   adoptMeter,
   beginStep,
   beginTurn,
   createMeter,
+  deliver,
   display,
   endStep,
   endTurn,
@@ -94,6 +96,28 @@ const sharedMeters = (): Map<string, Meter> => {
   return meters
 }
 
+/**
+ * The delivery type of every enqueued inbox item, keyed by inbox ID, until it
+ * is delivered or cancelled. Shared across generations like the meters: an
+ * item can be queued before a source save and delivered after, and a lost type
+ * would silently merge the queued prompt into the turn before it — the very
+ * split this bookkeeping exists to make.
+ */
+const DELIVERIES = "__opencodeStatusLineDeliveries"
+
+const sharedDeliveries = (): Map<string, Delivery> => {
+  const shared = globalThis as Record<string, unknown>
+  const existing = shared[DELIVERIES]
+  if (existing instanceof Map) return existing as Map<string, Delivery>
+  const deliveries = new Map<string, Delivery>()
+  shared[DELIVERIES] = deliveries
+  return deliveries
+}
+
+/** The host's delivery string as the known delivery type, when it is one. */
+const asDelivery = (value: string | undefined): Delivery | undefined =>
+  value === "steer" || value === "queue" ? value : undefined
+
 /** The bits of the event payloads this plugin reads. */
 interface Tokens {
   output?: number
@@ -108,6 +132,12 @@ interface Event {
     assistantMessageID?: string
     delta?: string
     tokens?: Tokens
+    /** The inbox item an enqueue names; its `delivery` says how it will run. */
+    item?: { delivery?: string }
+    /** The inbox item an enqueue, delivery, change or cancel names. */
+    inboxID?: string
+    /** The delivery type a change reports. */
+    delivery?: string
   }
 }
 
@@ -148,6 +178,7 @@ export default Plugin.define({
     }
 
     const meters = sharedMeters()
+    const deliveries = sharedDeliveries()
     // A hot reload can hand this generation meters saved before the class
     // ratios existed; adopt them rather than reading NaN estimates until the
     // stream restarts.
@@ -375,7 +406,9 @@ export default Plugin.define({
         }),
       ),
       // Turn boundaries: a prompt starts an execution, and its settlement ends
-      // it. The fold resets only here; anything else would split a turn.
+      // it; a queued prompt's delivery (below) is the boundary a single
+      // busy-period `session.execution.started` cannot draw. The fold resets at
+      // those points alone — a steer is deliberately not a boundary.
       context.data.on(
         "session.execution.started",
         safely((event: Event) => {
@@ -391,6 +424,53 @@ export default Plugin.define({
       // closes the fold too, and a second close is a no-op. Without it a turn
       // that ended quietly would bleed into the next one's cumulative figure.
       context.data.on("session.idle", safely(onTurnEnd)),
+      // A queued prompt is a turn boundary of its own: one execution busy
+      // period publishes a single `session.execution.started`, so the host can
+      // process several queued prompts under one begin/end pair. Each item's
+      // delivery type is remembered from its enqueue — and kept current if it
+      // changes while it waits — so a queued delivery can close the fold and
+      // start a fresh one, giving every prompt its own average. A steer leaves
+      // the fold alone, and an item queued before this generation loaded (its
+      // type was never seen) reads as a steer rather than splitting a turn on
+      // a guess. `deliver` reuses the turn-close semantics.
+      context.data.on(
+        "session.inbox.enqueued",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID !== "string") return
+          const delivery = asDelivery(data.item?.delivery)
+          if (delivery) deliveries.set(data.inboxID, delivery)
+        }),
+      ),
+      context.data.on(
+        "session.inbox.delivery.changed",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID !== "string") return
+          const delivery = asDelivery(data.delivery)
+          if (delivery) deliveries.set(data.inboxID, delivery)
+        }),
+      ),
+      context.data.on(
+        "session.inbox.delivered",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID !== "string") return
+          const delivery = deliveries.get(data.inboxID)
+          // The item left the inbox whether or not this generation can use it.
+          deliveries.delete(data.inboxID)
+          if (typeof data?.sessionID !== "string") return
+          deliver(meter(data.sessionID), delivery, Date.now(), opts)
+          bump()
+        }),
+      ),
+      context.data.on(
+        "session.inbox.cancelled",
+        safely((event: Event) => {
+          const data = event?.data
+          if (typeof data?.inboxID === "string") deliveries.delete(data.inboxID)
+        }),
+      ),
       // Cost, tokens and the context window live on the session record; any
       // update to it should repaint the usage line.
       context.data.on("session.usage.updated", safely(() => bump())),

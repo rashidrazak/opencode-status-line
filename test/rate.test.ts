@@ -6,6 +6,7 @@ import {
   beginTurn,
   createMeter,
   cumulativeRate,
+  deliver,
   display,
   endStep,
   endTurn,
@@ -766,6 +767,109 @@ describe("turn fold", () => {
       endStep(meter, `s${index}`, { output: 100 }, T0 + index * 1_000 + 1_200, T0 + index * 1_000 + 1_200, opts)
       endTurn(meter, T0 + index * 1_000 + 1_300, opts)
     }
+    expect(meter.history).toHaveLength(2)
+  })
+})
+
+describe("prompt delivery", () => {
+  test("two queued prompts produce two samples, not one merged figure", () => {
+    const meter = createMeter()
+    // One execution busy period: the host publishes a single beginTurn and
+    // promotes both queued prompts inside it.
+    beginTurn(meter, T0)
+
+    // The first queued prompt is delivered and runs; the fold is already
+    // fresh, so its delivery has nothing to close.
+    deliver(meter, "queue", T0)
+    beginStep(meter, "a", T0, T0)
+    stream(meter, T0 + 1_000, 1_000, 400)
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100) // 100 tokens in 0.9 s
+
+    // The second queued prompt's delivery closes the first prompt's fold.
+    deliver(meter, "queue", T0 + 2_150)
+    expect(meter.history).toHaveLength(1)
+    expect(meter.history[0]!.tokens).toBe(100)
+
+    beginStep(meter, "b", T0 + 2_200, T0 + 2_200)
+    stream(meter, T0 + 3_200, 1_000, 400)
+    endStep(meter, "b", { output: 200 }, T0 + 4_300, T0 + 4_300) // 200 tokens in 0.9 s
+
+    // The busy period settles at the end: the second prompt's own fold lands
+    // beside the first, not merged with it.
+    endTurn(meter, T0 + 4_400)
+    expect(meter.history).toHaveLength(2)
+    expect(meter.history[0]!.tps).toBeCloseTo(111.1, 1)
+    expect(meter.history[1]!.tps).toBeCloseTo(222.2, 1)
+    expect(meter.history[0]!.tokens).toBe(100)
+    expect(meter.history[1]!.tokens).toBe(200)
+  })
+
+  test("a delivery with an empty fold leaves a step in flight alone", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    // The first prompt of the busy period: its delivery arrives after its
+    // step already started. There is no fold to close yet, and the open step
+    // must keep streaming rather than being cleared by the boundary.
+    beginStep(meter, "a", T0, T0)
+    stream(meter, T0 + 100, 1_000, 400)
+    deliver(meter, "queue", T0 + 1_200)
+    expect(meter.step?.assistantMessageID).toBe("a")
+    endStep(meter, "a", { output: 100 }, T0 + 1_300, T0 + 1_300)
+    expect(meter.final?.kind).toBe("turn")
+    expect(meter.final?.tokens).toBe(100)
+  })
+
+  test("a steer keeps the turn in flight whole", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "a", T0, T0)
+    stream(meter, T0 + 1_000, 1_000, 400)
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100)
+
+    // A mid-turn correction joins the turn: no close, no split.
+    deliver(meter, "steer", T0 + 2_150)
+    // An item queued before the plugin loaded has no remembered type;
+    // treating it as a steer preserves the turn rather than splitting it on a
+    // guess.
+    deliver(meter, undefined, T0 + 2_160)
+    expect(meter.history).toHaveLength(0)
+    expect(meter.turn.tokens).toBe(100)
+
+    beginStep(meter, "b", T0 + 2_200, T0 + 2_200)
+    stream(meter, T0 + 3_200, 1_000, 400)
+    endStep(meter, "b", { output: 200 }, T0 + 4_300, T0 + 4_300)
+
+    endTurn(meter, T0 + 4_400)
+    expect(meter.history).toHaveLength(1)
+    expect(meter.history[0]!.tokens).toBe(300)
+  })
+
+  test("a queued delivery closes once and the execution end stays a no-op", () => {
+    const meter = createMeter()
+    beginTurn(meter, T0)
+    beginStep(meter, "a", T0, T0)
+    stream(meter, T0 + 1_000, 1_000, 400)
+    endStep(meter, "a", { output: 100 }, T0 + 2_100, T0 + 2_100)
+    deliver(meter, "queue", T0 + 2_150)
+    expect(meter.history).toHaveLength(1)
+    // The execution settles after the delivery and finds an empty fold: the
+    // already-closed prompt is not counted a second time.
+    endTurn(meter, T0 + 2_200)
+    expect(meter.history).toHaveLength(1)
+  })
+
+  test("delivery-closed turns obey the history cap", () => {
+    const opts: RateOptions = { ...DEFAULT_RATE, historySamples: 2 }
+    const meter = createMeter(opts)
+    beginTurn(meter, T0)
+    for (let index = 0; index < 3; index++) {
+      const at = T0 + index * 3_000
+      beginStep(meter, `s${index}`, at, at)
+      stream(meter, at + 1_000, 1_000, 400, opts)
+      endStep(meter, `s${index}`, { output: 100 }, at + 2_100, at + 2_100, opts)
+      deliver(meter, "queue", at + 2_150, opts)
+    }
+    endTurn(meter, T0 + 9_000, opts)
     expect(meter.history).toHaveLength(2)
   })
 })

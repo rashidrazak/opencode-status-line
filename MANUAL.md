@@ -398,6 +398,13 @@ wears `✓`.
 { "turn": { "fold": false } }
 ```
 
+Queued prompts are turn boundaries of their own. When you queue a prompt and
+OpenCode runs it back to back with the one before — even inside the same
+execution — the queue's delivery ends the first prompt's average and starts a
+fresh one, so the stats dialog counts two turns rather than showing one merged
+figure. A steer is different: it belongs to the turn it corrects, so delivering
+one mid-turn never resets the fold or splits the average.
+
 ### Characters per token
 
 The plugin converts streamed characters into tokens using two ratios — one for
